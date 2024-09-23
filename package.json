@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-web-app",
+  "version": "1.0.0",
+  "description": "Node.js app using whatsapp-web.js",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^0.21.1",
+    "express": "^4.17.1",
+    "mime-types": "^2.1.27",
+    "qrcode": "^1.4.4",
+    "whatsapp-web.js": "^1.13.2",
+    "zip": "^1.2.0"
+  }
+}
