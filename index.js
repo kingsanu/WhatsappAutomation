@@ -1,174 +1,448 @@
-const { Client, LocalAuth, MessageMedia, Buttons } = require('whatsapp-web.js');
-const express = require('express');
-const fs = require('fs');
-const QRCode = require('qrcode');
-const axios = require('axios');
-const mime = require('mime-types');
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+const express = require("express");
+const QRCode = require("qrcode");
+const sqlite3 = require("sqlite3").verbose();
+const { open } = require("sqlite");
+const axios = require("axios");
+const mime = require("mime-types");
+const path = require("path");
+const fs = require("fs").promises;
 
 const app = express();
 app.use(express.json());
 
 const sessions = {};
-const SESSION_FILE_PATH = './whatsapp-sessions.json';
+let db;
 
-// Load sessions from file
-const loadSessions = () => {
-    if (fs.existsSync(SESSION_FILE_PATH)) {
-        const file = fs.readFileSync(SESSION_FILE_PATH);
-        return JSON.parse(file);
+// Configuration
+const MAX_RETRIES = 5;
+const RETRY_INTERVAL = 5000; // 5 seconds
+const CONNECTION_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const PORT = process.env.PORT || 8080;
+
+// Database initialization
+const initializeDatabase = async () => {
+  db = await open({
+    filename: "./whatsapp_sessions.db",
+    driver: sqlite3.Database,
+  });
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      userId TEXT PRIMARY KEY,
+      sessionId TEXT,
+      isAuthenticated INTEGER,
+      lastActive TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      lastError TEXT
+    )
+  `);
+};
+
+// Session management functions
+const updateLastActive = async (userId) => {
+  await db.run(
+    "UPDATE sessions SET lastActive = CURRENT_TIMESTAMP WHERE userId = ?",
+    [userId]
+  );
+};
+
+const updateSessionError = async (userId, error) => {
+  await db.run("UPDATE sessions SET lastError = ? WHERE userId = ?", [
+    error.toString(),
+    userId,
+  ]);
+};
+
+const saveSession = async (userId, sessionId, isAuthenticated) => {
+  await db.run(
+    "INSERT OR REPLACE INTO sessions (userId, sessionId, isAuthenticated, lastActive, lastError) VALUES (?, ?, ?, CURRENT_TIMESTAMP, NULL)",
+    [userId, sessionId, isAuthenticated ? 1 : 0]
+  );
+};
+
+const loadSessions = async () => {
+  return await db.all("SELECT * FROM sessions");
+};
+
+// Reconnection handling
+const handleReconnection = async (
+  client,
+  userId,
+  sessionId,
+  retryCount = 0
+) => {
+  try {
+    if (client.isConnected) {
+      console.log(`Client ${userId} is already connected`);
+      return true;
     }
-    return {};
-};
 
-// Save sessions to file
-const saveSessions = (sessions) => {
-    fs.writeFileSync(SESSION_FILE_PATH, JSON.stringify(sessions));
-};
+    await client.initialize();
+    console.log(`Reconnected client for user ${userId}`);
+    await updateLastActive(userId);
+    return true;
+  } catch (error) {
+    console.error(
+      `Reconnection attempt ${retryCount + 1} failed for user ${userId}:`,
+      error
+    );
+    await updateSessionError(userId, error);
 
-// Initialize sessions
-const initializeSessions = async () => {
-    const savedSessions = loadSessions();
-    for (const id of Object.keys(savedSessions)) {
-        await createSession(id, false);
+    if (retryCount < MAX_RETRIES) {
+      const waitTime = RETRY_INTERVAL * Math.pow(2, retryCount); // Exponential backoff
+      console.log(`Retrying in ${waitTime / 1000} seconds...`);
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
+      return handleReconnection(client, userId, sessionId, retryCount + 1);
     }
+
+    console.error(`Max retries reached for user ${userId}`);
+    return false;
+  }
 };
 
-const createSession = (id, isNew = true) => {
-    return new Promise((resolve, reject) => {
-        const client = new Client({
-            authStrategy: new LocalAuth({ clientId: id })
-        });
+// Client creation
+const createSession = (userId, sessionId) => {
+  return new Promise((resolve, reject) => {
+    const client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: sessionId,
+        dataPath: "./sessions",
+        puppeteer: {
+          executablePath: "/usr/bin/google-chrome",
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-gpu",
+            "--headless",
+          ],
+          headless: true,
+        },
 
-        let qrCodeBase64 = null;
-
-        client.on('qr', (qr) => {
-            console.log(`QR for session ${id}:`);
-            QRCode.toDataURL(qr, (err, url) => {
-                if (err) {
-                    console.error(`Failed to generate QR code for session ${id}`, err);
-                    reject(err);
-                } else {
-                    qrCodeBase64 = url;
-                    if (isNew) {
-                        resolve({ qrCodeBase64, client });
-                    }
-                }
-            });
-        });
-
-        client.on('ready', () => {
-            console.log(`Client ${id} is ready!`);
-            if (isNew && qrCodeBase64) {
-                resolve({ qrCodeBase64, client });
-            } else if (isNew) {
-                resolve({ qrCodeBase64: null, client });
-            }
-            notifySessionReady(id);
-        });
-
-        client.on('authenticated', () => {
-            console.log(`Client ${id} is authenticated!`);
-            sessions[id] = client;
-            saveSessions(Object.keys(sessions));
-            if (!isNew) {
-                resolve({ qrCodeBase64: null, client });
-            }
-        });
-
-        client.on('auth_failure', () => {
-            console.log(`Client ${id} authentication failure!`);
-            delete sessions[id];
-            saveSessions(Object.keys(sessions));
-            reject(new Error('Authentication failure'));
-        });
-
-        client.on('disconnected', (reason) => {
-            console.log(`Client ${id} disconnected: ${reason}`);
-            delete sessions[id];
-            saveSessions(Object.keys(sessions));
-        });
-
-        client.initialize();
+        backupSyncIntervalMs: 300000, // Backup auth state every 5 minutes
+      }),
+      // Very important settings for session persistence
+      restartOnAuthFail: true,
+      takeoverOnConflict: true,
+      takeoverTimeoutMs: 0,
+      // Use a mobile user agent to mimic phone app
+      webVersionCache: {
+        type: "local",
+        path: "./sessions/webCache",
+        // Set a longer TTL for web version cache
+        ttl: 7 * 24 * 60 * 60 * 1000, // 7 days
+      },
+      // Keep alive settings
+      qrMaxRetries: 3,
+      connectDelay: 5000,
+      authTimeoutMs: 0,
     });
+
+    // Add these event listeners
+    client.on("auth_failure", async () => {
+      await client.initialize(); // Try to reinitialize immediately
+    });
+
+    client.on("disconnected", async (reason) => {
+      // Wait a bit before trying to reconnect
+      setTimeout(async () => {
+        await client.initialize();
+      }, 3000);
+    });
+
+    let qrCodeBase64 = null;
+
+    client.on("qr", (qr) => {
+      QRCode.toDataURL(qr, (err, url) => {
+        if (err) reject(err);
+        qrCodeBase64 = url;
+        resolve({ qrCodeBase64, client });
+      });
+    });
+
+    client.on("authenticated", async () => {
+      await saveSession(userId, sessionId, true);
+      sessions[sessionId] = client;
+      console.log(`Client for user ${userId} authenticated`);
+      await updateLastActive(userId);
+
+      // Save auth state immediately after authentication
+      await client.saveState().catch((err) => {
+        console.error(`Failed to save state for user ${userId}:`, err);
+      });
+    });
+
+    client.on("ready", async () => {
+      console.log(`Client for user ${userId} is ready`);
+      await updateLastActive(userId);
+    });
+
+    client.on("disconnected", async (reason) => {
+      console.log(`Client for user ${userId} was disconnected:`, reason);
+      await updateSessionError(userId, `Disconnected: ${reason}`);
+
+      console.log(`Attempting to reconnect client for user ${userId}...`);
+      const reconnected = await handleReconnection(client, userId, sessionId);
+
+      if (!reconnected) {
+        await saveSession(userId, sessionId, false);
+        delete sessions[sessionId];
+      }
+    });
+
+    client.on("auth_failure", async (error) => {
+      console.log(`Auth failure for user ${userId}:`, error);
+      await updateSessionError(userId, `Authentication failed: ${error}`);
+      await saveSession(userId, sessionId, false);
+      delete sessions[sessionId];
+    });
+
+    client.on("change_state", async (state) => {
+      console.log(`State changed to ${state} for user ${userId}`);
+      if (state === "CONNECTED") {
+        await updateLastActive(userId);
+      }
+    });
+
+    client.initialize().catch(async (err) => {
+      console.error(`Failed to initialize client for user ${userId}:`, err);
+      await updateSessionError(userId, err);
+      reject(err);
+    });
+    // Add this to your createSession function
+    setInterval(async () => {
+      try {
+        await client.saveState();
+      } catch (error) {
+        console.error("Failed to backup auth state:", error);
+      }
+    }, 300000); // Every 5 minutes
+  });
 };
 
-// Notify external callback URL when session is ready
-const notifySessionReady = async (id) => {
-    const callbackUrl = 'YOUR_CALLBACK_URL_HERE';  // Replace with your callback URL
-    try {
-        await axios.post(callbackUrl, { sessionId: id });
-        console.log(`Notified session ready for session ${id}`);
-    } catch (error) {
-        console.error(`Failed to notify session ready for session ${id}`, error);
-    }
-};
-
-// Create a new session
-app.post('/create-session', async (req, res) => {
-    const { id } = req.body;
-
-    // Check if session exists and remove it if it does
-    if (sessions[id]) {
-        await sessions[id].destroy();
-        delete sessions[id];
-        saveSessions(Object.keys(sessions));
-    }
-
-    try {
-        const { qrCodeBase64 } = await createSession(id);
-        if (qrCodeBase64) {
-            res.json({ message: `Session ${id} created`, qr: qrCodeBase64 });
-        } else {
-            res.json({ message: `Session ${id} created and authenticated` });
-        }
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to create session', details: error.message });
-    }
+// API Endpoints
+app.get("/", (req, res) => {
+  res.json({ message: "WhatsApp Automation API is running!" });
 });
 
-// Send a message with image and buttons
-app.post('/send-message', async (req, res) => {
-    const { id, number, message, imageUrl, buttons } = req.body;
-    const client = sessions[id];
+app.get("/session-status/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const session = await db.get("SELECT * FROM sessions WHERE userId = ?", [
+      userId,
+    ]);
+    if (!session) {
+      return res.status(404).json({ status: "No session found" });
+    }
+
+    const client = sessions[session.sessionId];
+    const isConnected = client ? client.isConnected : false;
+
+    res.json({
+      userId,
+      sessionId: session.sessionId,
+      isAuthenticated: Boolean(session.isAuthenticated),
+      isConnected,
+      lastActive: session.lastActive,
+      lastError: session.lastError,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/create-session", async (req, res) => {
+  const { userId } = req.body;
+
+  try {
+    const existingSession = await db.get(
+      "SELECT * FROM sessions WHERE userId = ?",
+      [userId]
+    );
+    if (existingSession) {
+      return res
+        .status(400)
+        .json({ error: "Session already exists for this user" });
+    }
+
+    const sessionId = `user_${userId}_${Date.now()}`;
+    const { qrCodeBase64 } = await createSession(userId, sessionId);
+
+    res.json({
+      message: "Scan QR to link WhatsApp",
+      qr: qrCodeBase64,
+      sessionId,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/reconnect/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const session = await db.get("SELECT * FROM sessions WHERE userId = ?", [
+      userId,
+    ]);
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const client = sessions[session.sessionId];
     if (!client) {
-        return res.status(400).json({ error: 'Session not found' });
+      return res.status(400).json({ error: "Client not found" });
     }
-    try {
-        let mediaMessage;
-        if (imageUrl) {
-            const mimeType = mime.lookup(imageUrl);
-            const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-            const media = new MessageMedia(mimeType, Buffer.from(response.data).toString('base64'));
-            mediaMessage = media;
-        }
 
-        let buttonMessage;
-        if (buttons && buttons.length > 0) {
-            const formattedButtons = buttons.map(button => ({
-                buttonId: button.buttonId,
-                buttonText: { displayText: button.displayText },
-                type: 1 // Type 1 for regular buttons
-            }));
-            buttonMessage = new Buttons(message, formattedButtons, 'Title', 'Footer');
-        } else {
-            buttonMessage = message;
-        }
-
-        if (mediaMessage) {
-            await client.sendMessage(number + '@c.us', mediaMessage, { caption: message });
-        } else {
-            await client.sendMessage(number + '@c.us', buttonMessage);
-        }
-
-        res.json({ message: 'Message sent successfully' });
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to send message', details: error.message });
+    const reconnected = await handleReconnection(
+      client,
+      userId,
+      session.sessionId
+    );
+    if (reconnected) {
+      res.json({ message: "Successfully reconnected" });
+    } else {
+      res
+        .status(500)
+        .json({ error: "Failed to reconnect after multiple attempts" });
     }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// Start the server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    initializeSessions();
+app.post("/send-message", async (req, res) => {
+  const { userId, number, message, fileUrl } = req.body;
+
+  try {
+    const session = await db.get("SELECT * FROM sessions WHERE userId = ?", [
+      userId,
+    ]);
+    if (!session || !session.isAuthenticated) {
+      return res.status(403).json({ error: "WhatsApp not authenticated" });
+    }
+
+    const client = sessions[session.sessionId];
+    if (!client) {
+      return res.status(400).json({ error: "Session not found" });
+    }
+
+    if (!client.isConnected) {
+      return res.status(400).json({ error: "WhatsApp is not connected" });
+    }
+
+    const chat = await client.getChatById(number + "@c.us");
+
+    if (fileUrl) {
+      try {
+        const response = await axios.get(fileUrl, {
+          responseType: "arraybuffer",
+        });
+        const mimeType = response.headers["content-type"];
+        const extension =
+          mime.extension(mimeType) || path.extname(fileUrl).slice(1);
+        const fileName = `file.${extension}`;
+
+        const media = new MessageMedia(
+          mimeType,
+          Buffer.from(response.data).toString("base64"),
+          fileName
+        );
+
+        await chat.sendMessage(media, { caption: message });
+      } catch (error) {
+        console.error("Error sending file:", error);
+        return res.status(400).json({ error: "Failed to send file" });
+      }
+    } else if (message) {
+      await chat.sendMessage(message);
+    } else {
+      return res.status(400).json({ error: "No message or file URL provided" });
+    }
+
+    await updateLastActive(userId);
+    res.json({ message: "Message sent successfully" });
+  } catch (error) {
+    console.error("Error in send-message:", error);
+    await updateSessionError(userId, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Periodic connection check
+const checkConnections = async () => {
+  const savedSessions = await loadSessions();
+  for (const session of savedSessions) {
+    const client = sessions[session.sessionId];
+    if (client && !client.isConnected) {
+      console.log(
+        `Detected disconnected session for user ${session.userId}, attempting to reconnect...`
+      );
+      await handleReconnection(client, session.userId, session.sessionId);
+    }
+  }
+};
+const startServer = async () => {
+  try {
+    await initializeDatabase();
+    const savedSessions = await loadSessions();
+
+    for (const session of savedSessions) {
+      try {
+        // Add retry logic for session restoration
+        let retryCount = 0;
+        const maxRestoreRetries = 3;
+
+        while (retryCount < maxRestoreRetries) {
+          try {
+            await createSession(session.userId, session.sessionId);
+            console.log(`Restored session for user ${session.userId}`);
+            break;
+          } catch (error) {
+            retryCount++;
+            console.error(
+              `Attempt ${retryCount} failed to restore session for user ${session.userId}:`,
+              error
+            );
+
+            if (retryCount === maxRestoreRetries) {
+              await updateSessionError(
+                session.userId,
+                `Failed to restore after ${maxRestoreRetries} attempts: ${error}`
+              );
+            } else {
+              // Wait before retry (exponential backoff)
+              await new Promise((resolve) =>
+                setTimeout(resolve, 5000 * Math.pow(2, retryCount))
+              );
+            }
+          }
+        }
+      } catch (error) {
+        console.error(
+          `Failed to restore session for user ${session.userId}:`,
+          error
+        );
+        await updateSessionError(session.userId, error);
+      }
+    }
+
+    setInterval(checkConnections, 60 * 1000); // Check every minute instead of 5 minutes
+
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  }
+};
+startServer();
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("Shutting down gracefully...");
+  // Just close the database, don't destroy clients
+  await db.close();
+  process.exit(0);
 });

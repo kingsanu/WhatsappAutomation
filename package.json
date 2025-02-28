@@ -7,11 +7,14 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^0.21.1",
-    "express": "^4.17.1",
-    "mime-types": "^2.1.27",
-    "qrcode": "^1.4.4",
-    "whatsapp-web.js": "^1.13.2",
+    "axios": "^0.21.4",
+    "express": "^4.21.2",
+    "mime-types": "^2.1.35",
+    "nodemon": "^3.1.9",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.26.0",
     "zip": "^1.2.0"
   }
 }
