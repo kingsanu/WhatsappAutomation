@@ -1,0 +1,32 @@
+services:
+  api:
+    build:
+      context: . # Use project root as build context
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src:/app/src # Mount src for development
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      - redis
+      - postgres
+
+  redis:
+    image: redis:alpine
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: whatsapp
+      POSTGRES_PASSWORD: securepass
+      POSTGRES_DB: whatsapp
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  redis_data:
+  postgres_data:
