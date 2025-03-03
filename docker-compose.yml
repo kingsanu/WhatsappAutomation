@@ -1,22 +1,28 @@
+version: "3.8"
+
 services:
   api:
-    build:
-      context: . # Use project root as build context
-      dockerfile: Dockerfile
+    build: .
     ports:
       - "3000:3000"
-    volumes:
-      - ./src:/app/src # Mount src for development
     environment:
       - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 
   redis:
     image: redis:alpine
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   postgres:
     image: postgres:15-alpine
@@ -26,6 +32,11 @@ services:
       POSTGRES_DB: whatsapp
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whatsapp -d whatsapp"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   redis_data:
