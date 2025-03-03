@@ -1,6 +1,6 @@
 export const browsers = {
   chrome: {
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+    executablePath: process.env.CHROME_PATH || "/usr/bin/google-chrome-stable",
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -12,3 +12,6 @@ export const browsers = {
     ],
   },
 };
+
+// For CommonJS compatibility
+export default { browsers };
