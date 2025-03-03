@@ -1,6 +1,6 @@
 export const browsers = {
   chrome: {
-    executablePath: process.env.CHROME_PATH || "/usr/bin/chromium-browser",
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -10,9 +10,5 @@ export const browsers = {
       "--disable-gpu",
       "--remote-debugging-port=9222",
     ],
-  },
-  firefox: {
-    product: "firefox",
-    args: ["-headless"],
   },
 };

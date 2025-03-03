@@ -22,8 +22,10 @@ export const createBrowserPool = async () => {
       concurrency: Cluster.CONCURRENCY_BROWSER,
       maxConcurrency: parseInt(process.env.MAX_BROWSERS) || 5,
       puppeteerOptions: {
-        ...browserConfig,
-        headless: "new", // Use new headless mode
+        ...config.browsers.chrome,
+        headless: "new",
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+        // Use new headless mode
         args: [
           ...browserConfig.args,
           "--disable-features=site-per-process", // Important for WhatsApp Web
