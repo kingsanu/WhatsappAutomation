@@ -1,26 +1,25 @@
-FROM node:18-alpine
+FROM node:18-slim
 
-# Install Chrome dependencies
-RUN apk add --no-cache \
-    chromium \
-    nss \
-    freetype \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont
+# Install Chrome
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list' \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# Set Chrome path
+ENV CHROME_PATH=/usr/bin/google-chrome-stable
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
 WORKDIR /app
 
-# Copy package files first for better caching
 COPY package*.json ./
-
-# Install dependencies
 RUN npm install --omit=dev
 
-# Copy source files
 COPY src/ ./src/
 COPY .env .
 
-# Set entry point
 CMD ["node", "src/server.js"]
