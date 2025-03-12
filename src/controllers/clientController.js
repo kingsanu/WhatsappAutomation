@@ -1,10 +1,4 @@
-const {
-  MessageMedia,
-  Location,
-  Buttons,
-  List,
-  Poll,
-} = require("whatsapp-web.js");
+const { MessageMedia } = require("whatsapp-web.js");
 const { sessions } = require("../sessions");
 const { sendErrorResponse } = require("../utils");
 
@@ -15,9 +9,8 @@ const { sendErrorResponse } = require("../utils");
  * @function sendMessage
  * @param {Object} req - The request object containing the request parameters
  * @param {Object} req.body - The request body containing the chatId, content, contentType and options
- * @param {string} req.body.chatId - The chat id where the message will be sent
+ * @param {string} req.body.number - The number where the message will be sent
  * @param {string|Object} req.body.content - The message content to be sent, can be a string or an object containing the MessageMedia data
- * @param {string} req.body.contentType - The type of the message content, must be one of the following: 'string', 'MessageMedia', 'MessageMediaFromURL', 'Location', 'Buttons', or 'List'
  * @param {Object} req.body.options - Additional options to be passed to the WhatsApp API
  * @param {string} req.params.sessionId - The id of the WhatsApp session to be used
  * @param {Object} res - The response object
