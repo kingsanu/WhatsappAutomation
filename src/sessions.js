@@ -363,8 +363,8 @@ const initializeEvents = (client, sessionId) => {
   });
 
   client.on("qr", (qr) => {
-    // inject qr code into session
     client.qr = qr;
+
     checkIfEventisEnabled("qr").then((_) => {
       triggerWebhook(sessionWebhook, sessionId, "qr", { qr });
     });

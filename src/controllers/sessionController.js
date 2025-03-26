@@ -169,32 +169,51 @@ const sessionQrCodeImage = async (req, res) => {
   // #swagger.description = 'QR code as image of the session with the given session ID.'
   try {
     const sessionId = req.params.sessionId;
-    const session = sessions.get(sessionId);
+    let session = sessions.get(sessionId);
+
+    // If session doesn't exist, create it
     if (!session) {
       const setupSessionReturn = setupSession(sessionId);
       if (!setupSessionReturn.success) {
         return sendErrorResponse(res, 422, setupSessionReturn.message);
       }
+
+      session = setupSessionReturn.client;
+
+      const maxWaitTime = 300000; // 5 minutes
+      const startTime = Date.now();
+
+      while (!session.qr && Date.now() - startTime < maxWaitTime) {
+        await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 500ms between checks
+      }
+
+      // If QR code is available after waiting, return it
+      if (session.qr) {
+        const qrImage = qr.image(session.qr);
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+        });
+        return qrImage.pipe(res);
+      }
+
+      // QR code not available yet, but session started
       return res.json({
         success: true,
-        message: "Session initialization started",
+        message:
+          "Session initialization started, but QR not ready yet. Try again in a few seconds.",
         qr: null,
       });
     }
+
+    // Existing session logic
     if (session.qr) {
       const qrImage = qr.image(session.qr);
-      /* #swagger.responses[200] = {
-          description: "QR image.",
-          content: {
-            "image/png": {}
-          }
-        }
-      */
       res.writeHead(200, {
         "Content-Type": "image/png",
       });
       return qrImage.pipe(res);
     }
+
     return res.json({
       success: false,
       message: "qr code not ready or already scanned",
