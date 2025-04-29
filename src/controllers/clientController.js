@@ -19,51 +19,115 @@ const { sendErrorResponse } = require("../utils");
  */
 const sendMessage = async (req, res) => {
   try {
-    const { number, message, document, options } = req.body;
+    const { number, numbers, message, document, options } = req.body;
     const client = sessions.get(req.params.sessionId);
 
-    // Convert number to chatId
-    let chatId;
-    if (number) {
-      const numberDetails = await client.getNumberId(number);
-      if (numberDetails) {
-        chatId = numberDetails._serialized;
-      } else {
-        return sendErrorResponse(
-          res,
-          404,
-          "The provided phone number is not registered on WhatsApp"
-        );
-      }
-    } else {
-      return sendErrorResponse(res, 400, "Phone number is required");
+    // Validate input
+    if (!number && !numbers) {
+      return sendErrorResponse(res, 400, "Phone number(s) required");
     }
-
-    let messageOut;
-    if (document) {
-      // Handle document from URL with auto-detection
-      const messageMedia = await MessageMedia.fromUrl(document, {
-        unsafeMime: true,
-        filename: document.split("/").pop().split("?")[0], // Extract filename from URL
-      });
-
-      messageOut = await client.sendMessage(chatId, messageMedia, {
-        ...options,
-        caption: message || "", // Use message as caption if provided
-      });
-    } else if (message) {
-      // Handle text message
-      messageOut = await client.sendMessage(chatId, message, options);
-    } else {
+    if (!message && !document) {
       return sendErrorResponse(
         res,
         400,
         "Either message or document must be provided"
       );
     }
-    res.json({ success: true, message: messageOut });
+
+    // Handle both single number and bulk numbers
+    const recipientNumbers = numbers
+      ? Array.isArray(numbers)
+        ? numbers
+        : [numbers]
+      : [number];
+    const results = {
+      total: recipientNumbers.length,
+      successful: 0,
+      failed: 0,
+      details: [],
+    };
+
+    // Prepare media message if document provided
+    let messageMedia;
+    if (document) {
+      messageMedia = await MessageMedia.fromUrl(document, {
+        unsafeMime: true,
+        filename: document.split("/").pop().split("?")[0],
+      });
+    }
+
+    // Process each number
+    const processPromises = recipientNumbers.map((num) => {
+      return new Promise((resolve) => {
+        messageQueue.add(async () => {
+          try {
+            // Convert number to chatId
+            const numberDetails = await client.getNumberId(num);
+            if (!numberDetails) {
+              results.failed++;
+              results.details.push({
+                number: num,
+                status: "failed",
+                error: "Number not registered on WhatsApp",
+              });
+              resolve();
+              return;
+            }
+
+            const chatId = numberDetails._serialized;
+
+            // Send message
+            if (document) {
+              await client.sendMessage(chatId, messageMedia, {
+                ...options,
+                caption: message || "",
+              });
+            } else {
+              await client.sendMessage(chatId, message, options);
+            }
+
+            results.successful++;
+            results.details.push({
+              number: num,
+              status: "success",
+            });
+          } catch (error) {
+            results.failed++;
+            results.details.push({
+              number: num,
+              status: "failed",
+              error: error.message,
+            });
+          }
+          resolve();
+        });
+      });
+    });
+
+    // Wait for all messages to be queued
+    await Promise.all(processPromises);
+
+    // For single number, maintain the original response format
+    if (number && !numbers) {
+      const result = results.details[0];
+      if (result.status === "failed") {
+        return sendErrorResponse(
+          res,
+          result.error.includes("not registered") ? 404 : 500,
+          result.error
+        );
+      }
+      res.json({ success: true, message: "Message sent successfully" });
+    } else {
+      // For bulk messages, return detailed results
+      res.json({
+        success: true,
+        message: "Messages queued for sending",
+        results,
+      });
+    }
   } catch (error) {
-    console.log(error);
+    console.error(error);
     sendErrorResponse(res, 500, error.message);
   }
 };
