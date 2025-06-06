@@ -6,6 +6,9 @@ const {
   validateSession,
   flushSessions,
   sessions,
+  getSessionStats: getSessionStatsFromSessions,
+  getAllSessionsMetadata,
+  recoverSession: recoverSessionFromSessions,
 } = require("../sessions");
 const { sendErrorResponse, waitForNestedObject } = require("../utils");
 
@@ -25,7 +28,7 @@ const startSession = async (req, res) => {
   // #swagger.description = 'Starts a session for the given session ID.'
   try {
     const sessionId = req.params.sessionId;
-    const setupSessionReturn = setupSession(sessionId);
+    const setupSessionReturn = await setupSession(sessionId);
     if (!setupSessionReturn.success) {
       /* #swagger.responses[422] = {
         description: "Unprocessable Entity.",
@@ -173,7 +176,7 @@ const sessionQrCodeImage = async (req, res) => {
 
     // If session doesn't exist, create it
     if (!session) {
-      const setupSessionReturn = setupSession(sessionId);
+      const setupSessionReturn = await setupSession(sessionId);
       if (!setupSessionReturn.success) {
         return sendErrorResponse(res, 422, setupSessionReturn.message);
       }
@@ -405,6 +408,54 @@ const terminateAllSessions = async (req, res) => {
   }
 };
 
+/**
+ * Get session statistics and health information
+ */
+const getSessionStats = async (req, res) => {
+  try {
+    const stats = await getSessionStatsFromSessions();
+    res.json({ success: true, stats });
+  } catch (error) {
+    console.log("getSessionStats ERROR", error);
+    sendErrorResponse(res, 500, error.message);
+  }
+};
+
+/**
+ * Get all sessions metadata
+ */
+const getAllSessions = async (req, res) => {
+  try {
+    const sessionsData = await getAllSessionsMetadata();
+    res.json({ success: true, sessions: sessionsData });
+  } catch (error) {
+    console.log("getAllSessions ERROR", error);
+    sendErrorResponse(res, 500, error.message);
+  }
+};
+
+/**
+ * Manually recover a specific session
+ */
+const recoverSessionEndpoint = async (req, res) => {
+  try {
+    const sessionId = req.params.sessionId;
+    const result = await recoverSessionFromSessions(sessionId);
+
+    if (result) {
+      res.json({ success: true, message: "Session recovery initiated" });
+    } else {
+      res.json({
+        success: false,
+        message: "Failed to initiate session recovery",
+      });
+    }
+  } catch (error) {
+    console.log("recoverSession ERROR", error);
+    sendErrorResponse(res, 500, error.message);
+  }
+};
+
 module.exports = {
   startSession,
   statusSession,
@@ -414,4 +465,7 @@ module.exports = {
   terminateSession,
   terminateInactiveSessions,
   terminateAllSessions,
+  getSessionStats,
+  getAllSessions,
+  recoverSessionEndpoint,
 };

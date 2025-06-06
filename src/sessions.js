@@ -2,6 +2,8 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 const fs = require("fs");
 const path = require("path");
 const sessions = new Map();
+const sessionMetadataManager = require("./sessionMetadata");
+const sessionHealthMonitor = require("./sessionHealthMonitor");
 const {
   baseWebhookURL,
   sessionFolderPath,
@@ -10,6 +12,7 @@ const {
   webVersion,
   webVersionCacheType,
   recoverSessions,
+  maxConcurrentSessions,
 } = require("./config");
 const {
   triggerWebhook,
@@ -72,13 +75,17 @@ const validateSession = async (sessionId) => {
 };
 
 // Function to handle client session restoration
-const restoreSessions = () => {
+const restoreSessions = async () => {
   try {
+    // Initialize metadata manager first
+    await sessionMetadataManager.initialize();
+
     if (!fs.existsSync(sessionFolderPath)) {
       fs.mkdirSync(sessionFolderPath); // Create the session directory if it doesn't exist
     }
+
     // Read the contents of the folder
-    fs.readdir(sessionFolderPath, (_, files) => {
+    fs.readdir(sessionFolderPath, async (_, files) => {
       // Iterate through the files in the parent folder
       for (const file of files) {
         // Use regular expression to extract the string from the folder name
@@ -86,8 +93,27 @@ const restoreSessions = () => {
         if (match) {
           const sessionId = match[1];
           console.log("existing session detected", sessionId);
-          setupSession(sessionId);
+
+          // Check if we should restore this session
+          const metadata = await sessionMetadataManager.getSessionMetadata(
+            sessionId
+          );
+          if (!metadata || metadata.isActive !== false) {
+            await setupSession(sessionId);
+          }
         }
+      }
+
+      // Start health monitoring after restoration (only in production)
+      if (process.env.NODE_ENV !== "test") {
+        sessionHealthMonitor.setSessionManager({
+          getSession: (id) => sessions.get(id),
+          validateSession,
+          setupSession,
+          restartSession: reloadSession,
+          terminateSession: deleteSession,
+        });
+        sessionHealthMonitor.start();
       }
     });
   } catch (error) {
@@ -97,13 +123,23 @@ const restoreSessions = () => {
 };
 
 // Setup Session
-const setupSession = (sessionId) => {
+const setupSession = async (sessionId) => {
   try {
     if (sessions.has(sessionId)) {
       return {
         success: false,
         message: `Session already exists for: ${sessionId}`,
         client: sessions.get(sessionId),
+      };
+    }
+
+    // Check concurrent session limit
+    const activeCount = await sessionMetadataManager.getActiveSessionCount();
+    if (activeCount >= maxConcurrentSessions) {
+      return {
+        success: false,
+        message: `Maximum concurrent sessions limit reached (${maxConcurrentSessions})`,
+        client: null,
       };
     }
 
@@ -167,8 +203,23 @@ const setupSession = (sessionId) => {
 
     // Save the session to the Map
     sessions.set(sessionId, client);
+
+    // Save session metadata
+    await sessionMetadataManager.saveSessionMetadata(sessionId, {
+      status: "CONNECTING",
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      webhookUrl:
+        process.env[sessionId.toUpperCase() + "_WEBHOOK_URL"] || baseWebhookURL,
+    });
+
     return { success: true, message: "Session initiated successfully", client };
   } catch (error) {
+    await sessionMetadataManager.updateSessionActivity(
+      sessionId,
+      "ERROR",
+      error.message
+    );
     return { success: false, message: error.message, client: null };
   }
 };
@@ -209,7 +260,11 @@ const initializeEvents = (client, sessionId) => {
   });
 
   checkIfEventisEnabled("authenticated").then((_) => {
-    client.on("authenticated", () => {
+    client.on("authenticated", async () => {
+      await sessionMetadataManager.updateSessionActivity(
+        sessionId,
+        "AUTHENTICATED"
+      );
       triggerWebhook(sessionWebhook, sessionId, "authenticated");
     });
   });
@@ -227,7 +282,12 @@ const initializeEvents = (client, sessionId) => {
   });
 
   checkIfEventisEnabled("disconnected").then((_) => {
-    client.on("disconnected", (reason) => {
+    client.on("disconnected", async (reason) => {
+      await sessionMetadataManager.updateSessionActivity(
+        sessionId,
+        "DISCONNECTED",
+        reason
+      );
       triggerWebhook(sessionWebhook, sessionId, "disconnected", { reason });
     });
   });
@@ -362,8 +422,14 @@ const initializeEvents = (client, sessionId) => {
     });
   });
 
-  client.on("qr", (qr) => {
+  client.on("qr", async (qr) => {
     client.qr = qr;
+
+    // Update metadata with QR generation
+    const metadata =
+      (await sessionMetadataManager.getSessionMetadata(sessionId)) || {};
+    metadata.lastQrGenerated = new Date().toISOString();
+    await sessionMetadataManager.saveSessionMetadata(sessionId, metadata);
 
     checkIfEventisEnabled("qr").then((_) => {
       triggerWebhook(sessionWebhook, sessionId, "qr", { qr });
@@ -371,7 +437,11 @@ const initializeEvents = (client, sessionId) => {
   });
 
   checkIfEventisEnabled("ready").then((_) => {
-    client.on("ready", () => {
+    client.on("ready", async () => {
+      await sessionMetadataManager.updateSessionActivity(
+        sessionId,
+        "CONNECTED"
+      );
       triggerWebhook(sessionWebhook, sessionId, "ready");
     });
   });
@@ -489,6 +559,9 @@ const deleteSession = async (sessionId, validation) => {
     }
     await deleteSessionFolder(sessionId);
     sessions.delete(sessionId);
+
+    // Clean up session metadata
+    await sessionMetadataManager.removeSessionMetadata(sessionId);
   } catch (error) {
     console.log(error);
     throw error;
@@ -518,6 +591,31 @@ const flushSessions = async (deleteOnlyInactive) => {
   }
 };
 
+// Get session statistics
+const getSessionStats = async () => {
+  return await sessionMetadataManager.getSessionStats();
+};
+
+// Get all session metadata
+const getAllSessionsMetadata = async () => {
+  return await sessionMetadataManager.getAllActiveSessions();
+};
+
+// Manual session recovery
+const recoverSession = async (sessionId) => {
+  return await sessionHealthMonitor.recoverSession(sessionId);
+};
+
+// Get session by ID (for health monitor)
+const getSession = (sessionId) => {
+  return sessions.get(sessionId);
+};
+
+// Cleanup function for tests
+const cleanup = () => {
+  sessionHealthMonitor.stop();
+};
+
 module.exports = {
   sessions,
   setupSession,
@@ -526,4 +624,11 @@ module.exports = {
   deleteSession,
   reloadSession,
   flushSessions,
+  getSessionStats,
+  getAllSessionsMetadata,
+  recoverSession,
+  getSession,
+  sessionMetadataManager,
+  sessionHealthMonitor,
+  cleanup,
 };

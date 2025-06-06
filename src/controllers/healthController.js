@@ -1,7 +1,9 @@
-const fs = require('fs')
-const qrcode = require('qrcode-terminal')
-const { sessionFolderPath } = require('../config')
-const { sendErrorResponse } = require('../utils')
+/* eslint-disable no-undef */
+/* eslint-disable @typescript-eslint/no-var-requires */
+const fs = require("fs");
+const qrcode = require("qrcode-terminal");
+const { sessionFolderPath } = require("../config");
+const { sendErrorResponse } = require("../utils");
 
 /**
  * Responds to ping request with 'pong'
@@ -18,11 +20,11 @@ const ping = async (req, res) => {
     #swagger.tags = ['Various']
   */
   try {
-    res.json({ success: true, message: 'pong' })
+    res.json({ success: true, message: "pong" });
   } catch (error) {
-    sendErrorResponse(res, 500, error.message)
+    sendErrorResponse(res, 500, error.message);
   }
-}
+};
 
 /**
  * Example local callback function that generates a QR code and writes a log file
@@ -41,15 +43,27 @@ const localCallbackExample = async (req, res) => {
     #swagger.tags = ['Various']
   */
   try {
-    const { dataType, data } = req.body
-    if (dataType === 'qr') { qrcode.generate(data.qr, { small: true }) }
-    fs.writeFile(`${sessionFolderPath}/message_log.txt`, `${JSON.stringify(req.body)}\r\n`, { flag: 'a+' }, _ => _)
-    res.json({ success: true })
+    const { dataType, data } = req.body;
+    if (dataType === "qr") {
+      qrcode.generate(data.qr, { small: true });
+    }
+    fs.writeFile(
+      `${sessionFolderPath}/message_log.txt`,
+      `${JSON.stringify(req.body)}\r\n`,
+      { flag: "a+" },
+      (_) => _
+    );
+    res.json({ success: true });
   } catch (error) {
-    console.log(error)
-    fs.writeFile(`${sessionFolderPath}/message_log.txt`, `(ERROR) ${JSON.stringify(error)}\r\n`, { flag: 'a+' }, _ => _)
-    sendErrorResponse(res, 500, error.message)
+    console.log(error);
+    fs.writeFile(
+      `${sessionFolderPath}/message_log.txt`,
+      `(ERROR) ${JSON.stringify(error)}\r\n`,
+      { flag: "a+" },
+      (_) => _
+    );
+    sendErrorResponse(res, 500, error.message);
   }
-}
+};
 
-module.exports = { ping, localCallbackExample }
+module.exports = { ping, localCallbackExample };
