@@ -130,28 +130,66 @@ const sessionQrCode = async (req, res) => {
   // #swagger.description = 'QR code of the session with the given session ID.'
   try {
     const sessionId = req.params.sessionId;
-    const session = sessions.get(sessionId);
+    let session = sessions.get(sessionId);
+
+    // If session doesn't exist, create it
     if (!session) {
-      return res.json({ success: false, message: "session_not_found" });
+      const setupSessionReturn = await setupSession(sessionId);
+      if (!setupSessionReturn.success) {
+        return sendErrorResponse(res, 422, setupSessionReturn.message);
+      }
+      session = setupSessionReturn.client;
     }
-    if (session.qr) {
-      return res.json({ success: true, qr: session.qr });
+
+    // Check session state first
+    const validation = await validateSession(sessionId);
+    if (validation.success && validation.state === "CONNECTED") {
+      return res.json({
+        success: false,
+        message: "Session is already authenticated. QR code not needed.",
+        state: "CONNECTED",
+      });
     }
+
+    // Wait for QR code with timeout
+    const maxWaitTime = 60000; // 1 minute
+    const startTime = Date.now();
+    const checkInterval = 1000; // Check every second
+
+    while (Date.now() - startTime < maxWaitTime) {
+      if (session.qr) {
+        return res.json({
+          success: true,
+          qr: session.qr,
+          message: "QR code ready for scanning",
+        });
+      }
+
+      // Check if session became ready (authenticated)
+      try {
+        const currentState = await session.getState();
+        if (currentState === "CONNECTED") {
+          return res.json({
+            success: false,
+            message: "Session authenticated while waiting for QR",
+            state: "CONNECTED",
+          });
+        }
+      } catch (error) {
+        // Session might not be ready yet, continue waiting
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, checkInterval));
+    }
+
+    // Timeout reached
     return res.json({
       success: false,
-      message: "qr code not ready or already scanned",
+      message: "QR code generation timeout. Try restarting the session.",
+      suggestion: `Try calling /session/restart/${sessionId} and then request QR again`,
     });
   } catch (error) {
     console.log("sessionQrCode ERROR", error);
-    /* #swagger.responses[500] = {
-      description: "Server Failure.",
-      content: {
-        "application/json": {
-          schema: { "$ref": "#/definitions/ErrorResponse" }
-        }
-      }
-    }
-    */
     sendErrorResponse(res, 500, error.message);
   }
 };
@@ -180,58 +218,76 @@ const sessionQrCodeImage = async (req, res) => {
       if (!setupSessionReturn.success) {
         return sendErrorResponse(res, 422, setupSessionReturn.message);
       }
-
       session = setupSessionReturn.client;
+    }
 
-      const maxWaitTime = 300000; // 5 minutes
-      const startTime = Date.now();
-
-      while (!session.qr && Date.now() - startTime < maxWaitTime) {
-        await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 500ms between checks
-      }
-
-      // If QR code is available after waiting, return it
-      if (session.qr) {
-        const qrImage = qr.image(session.qr);
-        res.writeHead(200, {
-          "Content-Type": "image/png",
-        });
-        return qrImage.pipe(res);
-      }
-
-      // QR code not available yet, but session started
+    // Check session state first
+    const validation = await validateSession(sessionId);
+    if (validation.success && validation.state === "CONNECTED") {
       return res.json({
-        success: true,
-        message:
-          "Session initialization started, but QR not ready yet. Try again in a few seconds.",
-        qr: null,
+        success: false,
+        message: "Session is already authenticated. QR code not needed.",
+        state: "CONNECTED",
       });
     }
 
-    // Existing session logic
-    if (session.qr) {
-      const qrImage = qr.image(session.qr);
-      res.writeHead(200, {
-        "Content-Type": "image/png",
-      });
-      return qrImage.pipe(res);
+    // Wait for QR code with timeout
+    const maxWaitTime = 120000; // 2 minutes for image endpoint
+    const startTime = Date.now();
+    const checkInterval = 1000; // Check every second
+
+    while (Date.now() - startTime < maxWaitTime) {
+      if (session.qr) {
+        try {
+          const qrImage = qr.image(session.qr, { size: 10 });
+          res.writeHead(200, {
+            "Content-Type": "image/png",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            Pragma: "no-cache",
+            Expires: "0",
+          });
+          return qrImage.pipe(res);
+        } catch (qrError) {
+          console.log("QR image generation error:", qrError);
+          return res.json({
+            success: false,
+            message: "Failed to generate QR image",
+            qr: session.qr, // Return raw QR for manual processing
+          });
+        }
+      }
+
+      // Check if session became ready (authenticated)
+      try {
+        const currentState = await session.getState();
+        if (currentState === "CONNECTED") {
+          return res.json({
+            success: false,
+            message: "Session authenticated while waiting for QR",
+            state: "CONNECTED",
+          });
+        }
+      } catch (error) {
+        // Session might not be ready yet, continue waiting
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, checkInterval));
     }
 
+    // Timeout reached - provide helpful response
     return res.json({
       success: false,
-      message: "qr code not ready or already scanned",
+      message: "QR code generation timeout. Session may need restart.",
+      suggestion: `Try calling /session/restart/${sessionId} and then request QR again`,
+      troubleshooting: {
+        step1: "Check if WhatsApp Web is accessible",
+        step2: "Verify browser/Chrome is working properly",
+        step3: "Try restarting the session",
+        step4: "Check server logs for initialization errors",
+      },
     });
   } catch (error) {
     console.log("sessionQrCodeImage ERROR", error);
-    /* #swagger.responses[500] = {
-      description: "Server Failure.",
-      content: {
-        "application/json": {
-          schema: { "$ref": "#/definitions/ErrorResponse" }
-        }
-      }
-    }
-    */
     sendErrorResponse(res, 500, error.message);
   }
 };
@@ -456,6 +512,59 @@ const recoverSessionEndpoint = async (req, res) => {
   }
 };
 
+/**
+ * Force QR code regeneration for a session
+ */
+const forceQrRegeneration = async (req, res) => {
+  try {
+    const sessionId = req.params.sessionId;
+    const session = sessions.get(sessionId);
+
+    if (!session) {
+      return sendErrorResponse(res, 404, "Session not found");
+    }
+
+    // Check if session is already connected
+    const validation = await validateSession(sessionId);
+    if (validation.success && validation.state === "CONNECTED") {
+      return res.json({
+        success: false,
+        message:
+          "Session is already authenticated. QR regeneration not needed.",
+        state: "CONNECTED",
+      });
+    }
+
+    try {
+      // Clear existing QR
+      session.qr = null;
+
+      // Force a new QR by restarting the authentication process
+      await session.destroy();
+      sessions.delete(sessionId);
+
+      // Create new session
+      const setupResult = await setupSession(sessionId);
+      if (!setupResult.success) {
+        return sendErrorResponse(res, 500, setupResult.message);
+      }
+
+      res.json({
+        success: true,
+        message:
+          "QR regeneration initiated. Please wait and request QR code again.",
+        suggestion: `Wait 5-10 seconds, then call /session/qr/${sessionId} to get the new QR code`,
+      });
+    } catch (error) {
+      console.log("Force QR regeneration error:", error);
+      sendErrorResponse(res, 500, "Failed to regenerate QR code");
+    }
+  } catch (error) {
+    console.log("forceQrRegeneration ERROR", error);
+    sendErrorResponse(res, 500, error.message);
+  }
+};
+
 module.exports = {
   startSession,
   statusSession,
@@ -468,4 +577,5 @@ module.exports = {
   getSessionStats,
   getAllSessions,
   recoverSessionEndpoint,
+  forceQrRegeneration,
 };

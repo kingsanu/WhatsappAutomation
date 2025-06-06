@@ -10,12 +10,14 @@ This document outlines the improvements made to enhance session retention and su
 
 **Problem Solved:** Sessions were stored only in memory and lost on application restart.
 
-**Solution:** 
+**Solution:**
+
 - Added `SessionMetadataManager` class that persists session metadata to the file system
 - Session state, activity, and health information are now preserved across restarts
 - Metadata includes: status, last activity, connection attempts, errors, webhook URLs, and more
 
 **Files Added:**
+
 - `src/sessionMetadata.js` - Session metadata persistence manager
 
 ### 2. Session Health Monitoring
@@ -23,31 +25,46 @@ This document outlines the improvements made to enhance session retention and su
 **Problem Solved:** No automatic recovery or health monitoring for sessions.
 
 **Solution:**
+
 - Added `SessionHealthMonitor` class that continuously monitors session health
 - Automatic session recovery with configurable retry attempts
 - Proactive cleanup of inactive sessions
 - Real-time session statistics and health reporting
 
 **Files Added:**
+
 - `src/sessionHealthMonitor.js` - Session health monitoring system
 
 ### 3. Enhanced Session Management
 
 **Improvements Made:**
+
 - **Concurrent Session Limits:** Configurable maximum concurrent sessions
 - **Session Recovery:** Automatic recovery of failed sessions with retry logic
 - **Session Statistics:** Real-time monitoring of session health and status
 - **Better Error Handling:** Improved error tracking and recovery mechanisms
 
-### 4. New API Endpoints
+### 4. Enhanced QR Code Management
+
+**Problem Solved:** "qr code not ready or already scanned" errors
+
+**Solution:**
+
+- Enhanced QR endpoints with automatic waiting and retry logic
+- Smart session state detection before QR generation
+- Improved error messages with troubleshooting suggestions
+- Force QR regeneration capability
+
+### 5. New API Endpoints
 
 Added new endpoints for better session management:
 
 - `GET /session/stats` - Get session statistics and health information
 - `GET /session/all` - Get all sessions metadata
 - `GET /session/recover/:sessionId` - Manually trigger session recovery
+- `GET /session/regenerateQr/:sessionId` - Force QR code regeneration (NEW!)
 
-### 5. Configuration Enhancements
+### 6. Configuration Enhancements
 
 New environment variables for fine-tuning:
 
@@ -88,11 +105,13 @@ SESSION_METADATA_PATH=./sessions/metadata  # Path for metadata storage
 ## Usage Examples
 
 ### Get Session Statistics
+
 ```bash
 curl -H "x-api-key: your_api_key" http://localhost:3000/session/stats
 ```
 
 Response:
+
 ```json
 {
   "success": true,
@@ -108,11 +127,13 @@ Response:
 ```
 
 ### Get All Sessions
+
 ```bash
 curl -H "x-api-key: your_api_key" http://localhost:3000/session/all
 ```
 
 ### Manually Recover a Session
+
 ```bash
 curl -H "x-api-key: your_api_key" http://localhost:3000/session/recover/session123
 ```

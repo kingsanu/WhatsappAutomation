@@ -85,6 +85,11 @@ sessionRouter.get(
   middleware.sessionNameValidation,
   sessionController.recoverSessionEndpoint
 );
+sessionRouter.get(
+  "/regenerateQr/:sessionId",
+  middleware.sessionNameValidation,
+  sessionController.forceQrRegeneration
+);
 
 /**
  * ================

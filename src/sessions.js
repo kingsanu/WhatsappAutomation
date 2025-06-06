@@ -423,12 +423,15 @@ const initializeEvents = (client, sessionId) => {
   });
 
   client.on("qr", async (qr) => {
+    console.log(`QR code generated for session ${sessionId}`);
     client.qr = qr;
 
     // Update metadata with QR generation
     const metadata =
       (await sessionMetadataManager.getSessionMetadata(sessionId)) || {};
     metadata.lastQrGenerated = new Date().toISOString();
+    metadata.status = "QR_READY";
+    metadata.qrCount = (metadata.qrCount || 0) + 1;
     await sessionMetadataManager.saveSessionMetadata(sessionId, metadata);
 
     checkIfEventisEnabled("qr").then((_) => {
@@ -438,6 +441,11 @@ const initializeEvents = (client, sessionId) => {
 
   checkIfEventisEnabled("ready").then((_) => {
     client.on("ready", async () => {
+      console.log(`Session ${sessionId} is ready and authenticated`);
+
+      // Clear QR code since session is now authenticated
+      client.qr = null;
+
       await sessionMetadataManager.updateSessionActivity(
         sessionId,
         "CONNECTED"
