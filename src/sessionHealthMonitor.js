@@ -1,11 +1,11 @@
-const EventEmitter = require('events');
-const sessionMetadataManager = require('./sessionMetadata');
-const { 
-  sessionHealthCheckInterval, 
-  maxSessionRetries, 
-  sessionRetryDelay, 
-  sessionTimeout 
-} = require('./config');
+const EventEmitter = require("events");
+const sessionMetadataManager = require("./sessionMetadata");
+const {
+  sessionHealthCheckInterval,
+  maxSessionRetries,
+  sessionRetryDelay,
+  sessionTimeout,
+} = require("./config");
 
 class SessionHealthMonitor extends EventEmitter {
   constructor() {
@@ -21,10 +21,10 @@ class SessionHealthMonitor extends EventEmitter {
 
   start() {
     if (this.isMonitoring) return;
-    
+
     this.isMonitoring = true;
-    console.log('Starting session health monitoring...');
-    
+    console.log("Starting session health monitoring...");
+
     this.healthCheckTimer = setInterval(() => {
       this.performHealthCheck();
     }, sessionHealthCheckInterval);
@@ -34,10 +34,10 @@ class SessionHealthMonitor extends EventEmitter {
 
   stop() {
     if (!this.isMonitoring) return;
-    
+
     this.isMonitoring = false;
-    console.log('Stopping session health monitoring...');
-    
+    console.log("Stopping session health monitoring...");
+
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
@@ -45,19 +45,22 @@ class SessionHealthMonitor extends EventEmitter {
   }
 
   setupEventListeners() {
-    this.on('sessionDisconnected', async (sessionId, reason) => {
+    this.on("sessionDisconnected", async (sessionId, reason) => {
       console.log(`Session ${sessionId} disconnected: ${reason}`);
       await this.handleSessionDisconnection(sessionId, reason);
     });
 
-    this.on('sessionError', async (sessionId, error) => {
+    this.on("sessionError", async (sessionId, error) => {
       console.log(`Session ${sessionId} error: ${error.message}`);
       await this.handleSessionError(sessionId, error);
     });
 
-    this.on('sessionRecovered', async (sessionId) => {
+    this.on("sessionRecovered", async (sessionId) => {
       console.log(`Session ${sessionId} recovered successfully`);
-      await sessionMetadataManager.updateSessionActivity(sessionId, 'CONNECTED');
+      await sessionMetadataManager.updateSessionActivity(
+        sessionId,
+        "CONNECTED"
+      );
     });
   }
 
@@ -65,22 +68,24 @@ class SessionHealthMonitor extends EventEmitter {
     if (!this.sessionManager) return;
 
     try {
-      const activeSessions = await sessionMetadataManager.getAllActiveSessions();
-      
+      const activeSessions =
+        await sessionMetadataManager.getAllActiveSessions();
+
       for (const sessionData of activeSessions) {
         await this.checkSessionHealth(sessionData.sessionId);
       }
 
       // Clean up inactive sessions
-      const inactiveSessions = await sessionMetadataManager.getInactiveSessions(sessionTimeout);
-      
+      const inactiveSessions = await sessionMetadataManager.getInactiveSessions(
+        sessionTimeout
+      );
+
       for (const sessionId of inactiveSessions) {
         console.log(`Cleaning up inactive session: ${sessionId}`);
         await this.sessionManager.terminateSession(sessionId);
       }
-
     } catch (error) {
-      console.error('Health check failed:', error);
+      console.error("Health check failed:", error);
     }
   }
 
@@ -91,7 +96,9 @@ class SessionHealthMonitor extends EventEmitter {
       const session = this.sessionManager.getSession(sessionId);
       if (!session) {
         // Session not in memory, try to restore if it should be active
-        const metadata = await sessionMetadataManager.getSessionMetadata(sessionId);
+        const metadata = await sessionMetadataManager.getSessionMetadata(
+          sessionId
+        );
         if (metadata && metadata.isActive) {
           await this.attemptSessionRestore(sessionId);
         }
@@ -100,20 +107,22 @@ class SessionHealthMonitor extends EventEmitter {
 
       // Check if session is responsive
       const validation = await this.sessionManager.validateSession(sessionId);
-      
+
       if (!validation.success) {
-        if (validation.message === 'session_not_connected') {
-          this.emit('sessionDisconnected', sessionId, validation.message);
+        if (validation.message === "session_not_connected") {
+          this.emit("sessionDisconnected", sessionId, validation.message);
         } else {
-          this.emit('sessionError', sessionId, new Error(validation.message));
+          this.emit("sessionError", sessionId, new Error(validation.message));
         }
       } else {
         // Update last activity
-        await sessionMetadataManager.updateSessionActivity(sessionId, 'CONNECTED');
+        await sessionMetadataManager.updateSessionActivity(
+          sessionId,
+          "CONNECTED"
+        );
       }
-
     } catch (error) {
-      this.emit('sessionError', sessionId, error);
+      this.emit("sessionError", sessionId, error);
     }
   }
 
@@ -122,33 +131,34 @@ class SessionHealthMonitor extends EventEmitter {
     if (!metadata) return;
 
     const attempts = metadata.connectionAttempts || 0;
-    
+
     if (attempts < maxSessionRetries) {
-      console.log(`Attempting to reconnect session ${sessionId} (attempt ${attempts + 1})`);
-      
+      console.log(
+        `Attempting to reconnect session ${sessionId} (attempt ${attempts + 1})`
+      );
+
       setTimeout(async () => {
         try {
           await this.sessionManager.restartSession(sessionId);
-          this.emit('sessionRecovered', sessionId);
+          this.emit("sessionRecovered", sessionId);
         } catch (error) {
           await sessionMetadataManager.updateSessionActivity(
-            sessionId, 
-            'DISCONNECTED', 
+            sessionId,
+            "DISCONNECTED",
             error.message
           );
         }
       }, sessionRetryDelay);
-      
     } else {
       console.log(`Max reconnection attempts reached for session ${sessionId}`);
-      await sessionMetadataManager.updateSessionActivity(sessionId, 'FAILED');
+      await sessionMetadataManager.updateSessionActivity(sessionId, "FAILED");
     }
   }
 
   async handleSessionError(sessionId, error) {
     await sessionMetadataManager.updateSessionActivity(
-      sessionId, 
-      'ERROR', 
+      sessionId,
+      "ERROR",
       error.message
     );
 
@@ -156,10 +166,13 @@ class SessionHealthMonitor extends EventEmitter {
     if (this.isRecoverableError(error)) {
       setTimeout(async () => {
         try {
-          await this.sessionManager.reloadSession(sessionId);
-          this.emit('sessionRecovered', sessionId);
+          await this.sessionManager.restartSession(sessionId);
+          this.emit("sessionRecovered", sessionId);
         } catch (recoveryError) {
-          console.error(`Failed to recover session ${sessionId}:`, recoveryError);
+          console.error(
+            `Failed to recover session ${sessionId}:`,
+            recoveryError
+          );
         }
       }, sessionRetryDelay);
     }
@@ -171,28 +184,35 @@ class SessionHealthMonitor extends EventEmitter {
     try {
       console.log(`Attempting to restore session ${sessionId}`);
       const result = await this.sessionManager.setupSession(sessionId);
-      
+
       if (result.success) {
-        await sessionMetadataManager.updateSessionActivity(sessionId, 'CONNECTING');
-        this.emit('sessionRecovered', sessionId);
+        await sessionMetadataManager.updateSessionActivity(
+          sessionId,
+          "CONNECTING"
+        );
+        this.emit("sessionRecovered", sessionId);
       }
     } catch (error) {
       console.error(`Failed to restore session ${sessionId}:`, error);
-      await sessionMetadataManager.updateSessionActivity(sessionId, 'FAILED', error.message);
+      await sessionMetadataManager.updateSessionActivity(
+        sessionId,
+        "FAILED",
+        error.message
+      );
     }
   }
 
   isRecoverableError(error) {
     const recoverableErrors = [
-      'browser tab closed',
-      'session closed',
-      'page crashed',
-      'navigation timeout',
-      'connection lost',
-      'protocol error'
+      "browser tab closed",
+      "session closed",
+      "page crashed",
+      "navigation timeout",
+      "connection lost",
+      "protocol error",
     ];
-    
-    return recoverableErrors.some(recoverable => 
+
+    return recoverableErrors.some((recoverable) =>
       error.message.toLowerCase().includes(recoverable)
     );
   }
@@ -206,12 +226,19 @@ class SessionHealthMonitor extends EventEmitter {
     if (!this.sessionManager) return false;
 
     try {
-      await this.sessionManager.reloadSession(sessionId);
-      await sessionMetadataManager.updateSessionActivity(sessionId, 'CONNECTING');
+      await this.sessionManager.restartSession(sessionId);
+      await sessionMetadataManager.updateSessionActivity(
+        sessionId,
+        "CONNECTING"
+      );
       return true;
     } catch (error) {
       console.error(`Manual recovery failed for session ${sessionId}:`, error);
-      await sessionMetadataManager.updateSessionActivity(sessionId, 'ERROR', error.message);
+      await sessionMetadataManager.updateSessionActivity(
+        sessionId,
+        "ERROR",
+        error.message
+      );
       return false;
     }
   }
