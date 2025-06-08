@@ -1,6 +1,48 @@
+/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable no-undef */
 const { MessageMedia } = require("whatsapp-web.js");
 const { sessions } = require("../sessions");
 const { sendErrorResponse } = require("../utils");
+
+// Simple in-memory queue implementation
+class MessageQueue {
+  constructor() {
+    this.queue = [];
+    this.processing = false;
+  }
+
+  async add(task) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ task, resolve, reject });
+      this.process();
+    });
+  }
+
+  async process() {
+    if (this.processing || this.queue.length === 0) {
+      return;
+    }
+
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      const { task, resolve, reject } = this.queue.shift();
+      try {
+        const result = await task();
+        resolve(result);
+      } catch (error) {
+        reject(error);
+      }
+      // Add a small delay between messages to avoid rate limiting
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    this.processing = false;
+  }
+}
+
+// Create a global message queue instance
+const messageQueue = new MessageQueue();
 
 /**
  * Send a message to a chat using the WhatsApp API
