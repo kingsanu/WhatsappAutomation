@@ -2,10 +2,9 @@ services:
   app:
     container_name: whatsapp_web_api
     build: .
-    image: kanishkumar/whatsapp-web-api:latest
     restart: always
     ports:
-      - "3000:3000"
+      - "33001:3000"
     environment:
       # - API_KEY=your_global_api_key_here  # OPTIONAL
       - BASE_WEBHOOK_URL=http://localhost:3000/localCallbackExample
@@ -27,4 +26,4 @@ services:
       - MAX_CONCURRENT_SESSIONS=300 # OPTIONAL, MAXIMUM CONCURRENT SESSIONS
       - ENABLE_SESSION_PERSISTENCE=TRUE # OPTIONAL, ENABLE SESSION METADATA PERSISTENCE
     volumes:
-      - ./sessions:/usr/src/app/sessions # Mount the local ./sessions/ folder to the container's /usr/src/app/sessions folder
+      - ./my_sessions:/usr/src/app/sessions # Mount the local ./my_sessions/ folder to the container's /usr/src/app/sessions folder

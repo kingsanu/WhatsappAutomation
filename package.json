@@ -4,7 +4,7 @@
   "description": "REST API wrapper for whatsapp-web.js",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node init && node server.js",
     "test": "jest --runInBand",
     "swagger": "node swagger.js"
   },
