@@ -4,7 +4,7 @@ services:
     build: .
     restart: always
     ports:
-      - "33001:3000"
+      - "33002:3000"
     environment:
       # - API_KEY=your_global_api_key_here  # OPTIONAL
       - BASE_WEBHOOK_URL=http://localhost:3000/localCallbackExample
@@ -26,4 +26,4 @@ services:
       - MAX_CONCURRENT_SESSIONS=300 # OPTIONAL, MAXIMUM CONCURRENT SESSIONS
       - ENABLE_SESSION_PERSISTENCE=TRUE # OPTIONAL, ENABLE SESSION METADATA PERSISTENCE
     volumes:
-      - ./my_sessions:/usr/src/app/sessions # Mount the local ./my_sessions/ folder to the container's /usr/src/app/sessions folder
+      - ./my_sessions_2:/usr/src/app/sessions # Mount the local ./my_sessions/ folder to the container's /usr/src/app/sessions folder
