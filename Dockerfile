@@ -7,8 +7,8 @@ WORKDIR /app
 # Copy dependency definitions
 COPY package.json package-lock.json* ./
 
-# Install dependencies
-RUN npm ci --production=false
+# Install dependencies (use npm install to avoid lockfile mismatch)
+RUN npm install
 
 # Copy source code
 COPY . .
@@ -25,8 +25,8 @@ WORKDIR /app
 # Copy package.json for production install
 COPY package.json package-lock.json* ./
 
-# Install only production dependencies
-RUN npm ci --omit=dev
+# Install only production dependencies (use npm install to avoid lockfile issues)
+RUN npm install --omit=dev
 
 # Copy built artifacts
 COPY --from=builder /app/dist ./dist
