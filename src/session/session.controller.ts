@@ -143,4 +143,14 @@ export class SessionController {
       );
     }
   }
+
+  @Get('start/:username')
+  async startSession(@Param('username') username: string) {
+    // Optionally kick off session activation in background
+    this.whatsappService.activateSession(username).catch(() => {});
+    return {
+      success: true,
+      message: `Session start requested for user ${username}`
+    };
+  }
 }
