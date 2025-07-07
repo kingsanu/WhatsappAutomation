@@ -12,14 +12,13 @@ x86_64-linux = ["nodejs-22_x"]
 
 # Installation phase: use CI install for reproducibility
 [phases.setup]
-commands = [
-  "npm ci"
-]
+aptPkgs = ["curl", "wget"]  # install curl and wget via apt
+commands = ["npm ci"]
 
 # Build phase: compile TypeScript to JavaScript
 [phases.build]
-command = "npm run build"
+commands = ["npm run build"]
 
 # Start phase: run the built production server
 [phases.start]
-command = "npm run start:prod"
+start = { cmd = "npm run start:prod" }
