@@ -1,176 +1,277 @@
-# WhatsApp REST API
+# WhatsApp API with Baileys
 
-REST API wrapper for the [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) library, providing an easy-to-use interface to interact with the WhatsApp Web platform. 
-It is designed to be used as a docker container, scalable, secure, and easy to integrate with other non-NodeJs projects.
-
-This project is a work in progress: star it, create issues, features or pull requests ❣️
-
-**NOTE**: I can't guarantee you will not be blocked by using this method, although it has worked for me. WhatsApp does not allow bots or unofficial clients on their platform, so this shouldn't be considered totally safe.
-
-## Table of Contents
-
-[1. Quick Start with Docker](#quick-start-with-docker)
-
-[2. Features](#features)
-
-[3. Run Locally](#run-locally)
-
-[4. Testing](#testing)
-
-[5. Documentation](#documentation)
-
-[6. Deploy to Production](#deploy-to-production)
-
-[7. Contributing](#contributing)
-
-[8. License](#license)
-
-[9. Star History](#star-history)
-
-## Quick Start with Docker
-
-[![dockeri.co](https://dockerico.blankenship.io/image/chrishubert/whatsapp-web-api)](https://hub.docker.com/r/chrishubert/whatsapp-web-api)
-
-1. Clone the repository:
-
-```bash
-git clone https://github.com/chrishubert/whatsapp-api.git
-cd whatsapp-api
-```
-
-3. Run the Docker Compose:
-
-```bash
-docker-compose pull && docker-compose up
-```
-4. Visit http://localhost:3000/session/start/ABCD
-
-5. Scan the QR on your console using WhatsApp mobile app -> Linked Device -> Link a Device (it may take time to setup the session)
-
-6. Visit http://localhost:3000/client/getContacts/ABCD
-
-7. EXTRA: Look at all the callbacks data in `./session/message_log.txt`
-
-![Quick Start](./assets/basic_start.gif)
+A robust WhatsApp API built with NestJS and Baileys library that stores authentication credentials in MongoDB for persistent sessions.
 
 ## Features
 
-1. API and Callbacks
+- **Database-based Session Storage**: Authentication credentials stored in MongoDB instead of local files
+- **Intelligent Session Management**: Lazy loading with LRU cleanup for optimal memory usage
+- **Persistent Sessions**: Users stay logged in across server restarts without QR rescanning
+- **Auto-reconnection**: Seamless reconnection for active users
+- **QR Code Generation**: Generate QR codes for WhatsApp Web authentication
+- **Message Sending**: Send text messages and documents (images, videos, audio, PDFs)
+- **Session Management**: Create, terminate, and check session status
+- **Memory Efficient**: Only active users consume memory resources
+- **Industry Standards**: Built with NestJS, TypeScript, and follows best practices
 
-| Actions                      | Status | Sessions                                | Status | Callbacks                                      | Status |
-| ----------------------------| ------| ----------------------------------------| ------| ----------------------------------------------| ------|
-| Send Image Message           | ✅     | Initiate session                       | ✅    | Callback QR code                               | ✅     |
-| Send Video Message           | ✅     | Terminate session                      | ✅    | Callback new message                           | ✅     |
-| Send Audio Message           | ✅     | Terminate inactive sessions            | ✅    | Callback status change                         | ✅     |
-| Send Document Message        | ✅     | Terminate all sessions                 | ✅    | Callback message media attachment              | ✅     |
-| Send File URL                | ✅     | Healthcheck                            | ✅    |                                                |        |
-| Send Button Message          | ✅     | Local test callback                    |        |                                                |        |
-| Send Contact Message         | ✅     |                                        |        |                                                |        |
-| Send List Message            | ✅     |                                        |        |                                                |        |
-| Set Status                   | ✅     |                                        |        |                                                |        |
-| Send Button With Media       | ✅     |                                        |        |                                                |        |
-| Is On Whatsapp?              | ✅     |                                        |        |                                                |        |
-| Download Profile Pic         | ✅     |                                        |        |                                                |        |
-| User Status                  | ✅     |                                        |        |                                                |        |
-| Block/Unblock User           | ✅     |                                        |        |                                                |        |
-| Update Profile Picture       | ✅     |                                        |        |                                                |        |
-| Create Group                 | ✅     |                                        |        |                                                |        |
-| Leave Group                  | ✅     |                                        |        |                                                |        |
-| All Groups                   | ✅     |                                        |        |                                                |        |
-| Invite User                  | ✅     |                                        |        |                                                |        |
-| Make Admin                   | ✅     |                                        |        |                                                |        |
-| Demote Admin                 | ✅     |                                        |        |                                                |        |
-| Group Invite Code            | ✅     |                                        |        |                                                |        |
-| Update Group Participants    | ✅     |                                        |        |                                                |        |
-| Update Group Setting         | ✅     |                                        |        |                                                |        |
-| Update Group Subject         | ✅     |                                        |        |                                                |        |
-| Update Group Description     | ✅     |                                        |        |                                                |        |
+## Prerequisites
 
-3. Handle multiple client sessions (session data saved locally), identified by unique id
+- Node.js (v16 or higher)
+- MongoDB (local or cloud instance)
+- npm or yarn
 
-4. All endpoints may be secured by a global API key
-
-5. On server start, all existing sessions are restored
-
-6. Set messages automatically as read
-
-7. Disable any of the callbacks
-
-## Run Locally
+## Installation
 
 1. Clone the repository:
-
 ```bash
-git clone https://github.com/chrishubert/whatsapp-api.git
-cd whatsapp-api
+git clone <repository-url>
+cd WhatsappAutomation
 ```
 
-2. Install the dependencies:
-
+2. Install dependencies:
 ```bash
 npm install
 ```
 
-3. Copy the `.env.example` file to `.env` and update the required environment variables:
-
+3. Configure environment variables:
 ```bash
 cp .env.example .env
 ```
 
-4. Run the application:
-
-```bash
-npm run start
+Edit `.env` file with your configuration:
+```env
+NODE_ENV=development
+PORT=3000
+MONGODB_URI=mongodb://localhost:27017/whatsapp-api
+WHATSAPP_SESSION_PATH=./sessions
+QR_CODE_TIMEOUT=60000
+MAX_ACTIVE_SESSIONS=10
+SESSION_CLEANUP_INTERVAL=300000
+API_PREFIX=api/v1
 ```
 
-5. Access the API at `http://localhost:3000`
+4. Start MongoDB service (if running locally)
 
-## Testing
-
-Run the test suite with the following command:
-
+5. Run the application:
 ```bash
-npm run test
+# Development
+npm run start:dev
+
+# Production
+npm run build
+npm run start:prod
 ```
 
-## Documentation
+## API Endpoints
 
-API documentation can be found in the [`swagger.json`](https://raw.githubusercontent.com/chrishubert/whatsapp-api/master/swagger.json) file. See this file directly into [Swagger Editor](https://editor.swagger.io/?url=https://raw.githubusercontent.com/chrishubert/whatsapp-api/master/swagger.json) or any other OpenAPI-compatible tool to view and interact with the API documentation.
+### Session Management
 
-This documentation is straightforward if you are familiar with whatsapp-web.js library (https://docs.wwebjs.dev/)
-If you are still confused - open an issue and I'll improve it.
+#### 1. Get QR Code for Login
+```
+GET /api/v1/session/qr/{username}/image
+```
+- Creates a new session if doesn't exist
+- Returns QR code as PNG image
+- Scan with WhatsApp mobile app to login
 
-Also, there is an option to run the documentation endpoint locally by setting the `ENABLE_SWAGGER_ENDPOINT` environment variable. Restart the service and go to `/api-docs` endpoint to see it.
+#### 2. Terminate Session
+```
+DELETE /api/v1/session/terminate/{username}
+```
+- Logs out the user
+- Removes session data from database
+- Returns success confirmation
 
-By default, all callback events are delivered to the webhook defined with the `BASE_WEBHOOK_URL` environment variable.
-This can be overridden by setting the `*_WEBHOOK_URL` environment variable, where `*` is your sessionId.
-For example, if you have the sessionId defined as `DEMO`, the environment variable must be `DEMO_WEBHOOK_URL`.
+#### 3. Get Session Status
+```
+GET /api/v1/session/status/{username}
+```
+- Returns session information
+- Connection status
+- User details if connected
 
-By setting the `DISABLED_CALLBACKS` environment variable you can specify what events you are **not** willing to receive on your webhook.
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "exists": true,
+    "connected": true,
+    "connectionStatus": "connected",
+    "lastUpdated": "2025-07-07T10:30:00.000Z",
+    "user": {
+      "id": "1234567890@s.whatsapp.net",
+      "name": "User Name"
+    },
+    "isSessionActive": true
+  }
+}
+```
 
-### Scanning QR code
+### Message Sending
 
-In order to validate a new WhatsApp Web instance you need to scan the QR code using your mobile phone. Official documentation can be found at (https://faq.whatsapp.com/1079327266110265/?cms_platform=android) page. The service itself delivers the QR code content as a webhook event or you can use the REST endpoints (`/session/qr/:sessionId` or `/session/qr/:sessionId/image` to get the QR code as a png image). 
+#### Send Message/Document
+```
+POST /api/v1/client/sendMessage/{username}
+```
 
-## Deploy to Production
+Request Body:
+```json
+{
+  "number": "1234567890",  // Phone number with country code (no + sign)
+  "message": "Hello World!", // Optional: Text message
+  "document": "https://example.com/file.pdf" // Optional: Document URL
+}
+```
 
-- Load the docker image in docker-compose, or your Kubernetes environment
-- Disable the `ENABLE_LOCAL_CALLBACK_EXAMPLE` environment variable
-- Set the `API_KEY` environment variable to protect the REST endpoints
-- Run periodically the `/api/terminateInactiveSessions` endpoint to prevent useless sessions to take up space and resources(only in case you are not in control of the sessions)
+**Notes:**
+- Either `message` or `document` is required (not both)
+- `number` should include country code without + sign (e.g., "919876543210" for India)
+- `document` can be image, video, audio, or PDF URL
+- The API automatically detects file type and sends accordingly
 
-## Contributing
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "messageId": "3EB0C767D71D7B8A9E8B",
+    "timestamp": 1699123456
+  },
+  "message": "Message sent successfully"
+}
+```
 
-Please read [CONTRIBUTING.md](./CONTRIBUTING.md) for details on our code of conduct, and the process for submitting pull requests to us.
+## Usage Examples
 
-## Disclaimer
+### 1. Login Process
 
-This project is not affiliated, associated, authorized, endorsed by, or in any way officially connected with WhatsApp or any of its subsidiaries or its affiliates. The official WhatsApp website can be found at https://whatsapp.com. "WhatsApp" as well as related names, marks, emblems and images are registered trademarks of their respective owners.
+```bash
+# Get QR code
+curl -X GET "http://localhost:3000/api/v1/session/qr/john_doe/image" --output qr.png
+
+# Check status after scanning
+curl -X GET "http://localhost:3000/api/v1/session/status/john_doe"
+```
+
+### 2. Send Text Message
+
+```bash
+curl -X POST "http://localhost:3000/api/v1/client/sendMessage/john_doe" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "number": "919876543210",
+    "message": "Hello from WhatsApp API!"
+  }'
+```
+
+### 3. Send Document
+
+```bash
+curl -X POST "http://localhost:3000/api/v1/client/sendMessage/john_doe" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "number": "919876543210",
+    "document": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
+  }'
+```
+
+### 4. Logout
+
+```bash
+curl -X DELETE "http://localhost:3000/api/v1/session/terminate/john_doe"
+```
+
+## Database Schema
+
+### AuthState Collection
+
+```javascript
+{
+  _id: ObjectId,
+  userId: String,        // Unique username
+  credentials: Object,   // Baileys auth credentials
+  keys: Object,         // Baileys auth keys
+  connectionStatus: String, // Connection status
+  lastUpdated: Date,    // Last update timestamp
+  createdAt: Date,      // Created timestamp
+  updatedAt: Date       // Updated timestamp
+}
+```
+
+## Architecture
+
+```
+├── src/
+│   ├── schemas/           # MongoDB schemas
+│   │   └── auth-state.schema.ts
+│   ├── services/          # Business logic
+│   │   └── whatsapp.service.ts
+│   ├── dto/              # Data transfer objects
+│   │   └── send-message.dto.ts
+│   ├── session/          # Session management
+│   │   ├── session.controller.ts
+│   │   └── session.module.ts
+│   ├── client/           # Message sending
+│   │   ├── client.controller.ts
+│   │   └── client.module.ts
+│   ├── app.module.ts     # Main app module
+│   └── main.ts          # Application entry point
+```
+
+## Error Handling
+
+The API returns structured error responses:
+
+```json
+{
+  "status": 500,
+  "error": "Internal Server Error",
+  "message": "Detailed error message"
+}
+```
+
+Common HTTP status codes:
+- `200`: Success
+- `400`: Bad Request (invalid parameters)
+- `404`: Not Found (session not found)
+- `500`: Internal Server Error
+
+## Security Considerations
+
+1. **Environment Variables**: Keep sensitive data in environment variables
+2. **Database Security**: Use MongoDB authentication and encryption
+3. **Network Security**: Use HTTPS in production
+4. **Rate Limiting**: Implement rate limiting for production use
+5. **Input Validation**: All inputs are validated using class-validator
+
+## Troubleshooting
+
+### Common Issues
+
+1. **QR Code Timeout**: If QR code expires, call the endpoint again
+2. **Session Disconnected**: Check session status and recreate if needed
+3. **Message Sending Fails**: Ensure the session is connected and phone number is valid
+4. **MongoDB Connection**: Verify MongoDB is running and connection string is correct
+
+### Logs
+
+The application uses structured logging. Check console output for detailed error messages and connection status.
+
+## Development
+
+### Project Structure
+- Built with NestJS framework
+- TypeScript for type safety
+- MongoDB with Mongoose ODM
+- Baileys library for WhatsApp Web integration
+
+### Adding New Features
+1. Create new modules in respective folders
+2. Update app.module.ts to import new modules
+3. Add proper error handling and validation
+4. Update this README with new endpoints
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE.md](./LICENSE.md) file for details.
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=chrishubert/whatsapp-api&type=Date)](https://star-history.com/#chrishubert/whatsapp-api&Date)
+This project is licensed under the MIT License.
