@@ -29,15 +29,18 @@ interface SessionInfo {
 @Injectable()
 export class WhatsAppService implements OnModuleInit {
   private readonly logger = new Logger(WhatsAppService.name);
-  private readonly pinoLogger = pino({ 
-    level: 'warn',  // only warn and error
-    transport: {
-      target: 'pino-pretty',
-      options: {
-        colorize: true
-      }
+  private readonly pinoLogger = (() => {
+    const level = process.env.NODE_ENV === 'development' ? 'debug' : 'warn';
+    const options: any = { level };
+    // In non-production, use pretty transport
+    if (process.env.NODE_ENV !== 'production') {
+      options.transport = {
+        target: 'pino-pretty',
+        options: { colorize: true },
+      };
     }
-  });
+    return pino(options);
+  })();
   private activeSessions = new Map<string, SessionInfo>();
   private qrCodes = new Map<string, string>();
   private reconnectionAttempts = new Map<string, number>();
