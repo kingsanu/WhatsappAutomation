@@ -1,0 +1,25 @@
+# nixpacks.toml for WhatsappAutomation - Node.js 22 LTS
+name = "whatsapp-api"
+description = "WhatsApp API with NestJS and Baileys"
+
+# Use environment variables from .env at runtime
+[env]
+NODE_ENV = "production"
+
+# Target Node.js 22 LTS from nixpkgs
+[platforms]
+x86_64-linux = ["nodejs-22_x"]
+
+# Installation phase: use CI install for reproducibility
+[phases.setup]
+commands = [
+  "npm ci"
+]
+
+# Build phase: compile TypeScript to JavaScript
+[phases.build]
+command = "npm run build"
+
+# Start phase: run the built production server
+[phases.start]
+command = "npm run start:prod"
