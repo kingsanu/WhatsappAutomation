@@ -29,9 +29,24 @@ interface SessionInfo {
 @Injectable()
 export class WhatsAppService implements OnModuleInit {
   private readonly logger = new Logger(WhatsAppService.name);
-  // Use pino without external transport to avoid missing dependencies in production
+  // Use pino without external transport and suppress known Baileys decryption errors in logs
   private readonly pinoLogger = pino({
-    level: process.env.NODE_ENV === 'development' ? 'debug' : 'warn'
+    level: process.env.NODE_ENV === 'development' ? 'debug' : 'warn',
+    hooks: {
+      logMethod(args, method, levelLabel) {
+        try {
+          const msg = args[0];
+          const text = typeof msg === 'string' ? msg : JSON.stringify(msg);
+          // Suppress common decryption errors to reduce noise
+          if (text.includes('Bad decrypt') || text.includes('EVP_DecryptFinal_ex') || text.toLowerCase().includes('token is not valid')) {
+            return;
+          }
+        } catch (_) {
+          // ignore hook errors
+        }
+        method.apply(this, args);
+      }
+    }
   });
   private activeSessions = new Map<string, SessionInfo>();
   private qrCodes = new Map<string, string>();
@@ -42,10 +57,14 @@ export class WhatsAppService implements OnModuleInit {
   private readonly MAX_ACTIVE_SESSIONS = parseInt(process.env.MAX_ACTIVE_SESSIONS || '100'); // Increased default
   private readonly MAX_RAM_USAGE_MB = parseInt(process.env.MAX_RAM_USAGE_MB || '10240'); // 10GB default
   private readonly SESSION_CLEANUP_INTERVAL = parseInt(process.env.SESSION_CLEANUP_INTERVAL || '300000');
+  // How long before an idle session is considered stale (default 1h)
+  private readonly SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000');
   private readonly MAX_RECONNECTION_ATTEMPTS = 3;
   private readonly MAX_CONFLICT_ATTEMPTS = 2; // Stop conflicts early
   private readonly QR_CODE_TIMEOUT = parseInt(process.env.QR_CODE_TIMEOUT || '60000');
-  private readonly WEBHOOK_URL = 'https://adstudioserver.foodyqueen.com/api/whatsapp-webhook';
+  // private readonly WEBHOOK_URL = 'https://adstudioserver.foodyqueen.com/api/whatsapp-webhook';
+  // Webhook URL must be provided in environment; no default fallback
+  private readonly WEBHOOK_URL = process.env.WEBHOOK_URL;
 
   constructor(
     @InjectModel(AuthState.name)
@@ -56,6 +75,9 @@ export class WhatsAppService implements OnModuleInit {
     this.logger.log('WhatsApp Service initialized');
     // Start periodic cleanup
     setInterval(() => this.cleanupInactiveSessions(), this.SESSION_CLEANUP_INTERVAL);
+    // Restore any sessions persisted in DB at startup
+    this.logger.log('Restoring existing sessions from database...');
+    this.restoreExistingSessions().catch(err => this.logger.error('Restore sessions error', err));
     // Don't restore sessions automatically on startup to prevent conflicts
     // Sessions will be activated on-demand when needed
     this.logger.log('Session restoration disabled - sessions will activate on-demand');
@@ -85,7 +107,7 @@ export class WhatsAppService implements OnModuleInit {
       if (removedCount >= sessionsToRemove) break;
       
       const timeSinceLastUse = Date.now() - sessionInfo.lastUsed.getTime();
-      const isOld = timeSinceLastUse > 15 * 60 * 1000; // 15 minutes (reduced from 30)
+      const isOld = timeSinceLastUse > this.SESSION_IDLE_TIMEOUT_MS; // stale if idle beyond configured timeout
       const isInactive = !sessionInfo.isConnected;
       const isConflicted = (this.conflictAttempts.get(userId) || 0) > 0;
       
@@ -1273,8 +1295,8 @@ export class WhatsAppService implements OnModuleInit {
       this.logger.log(`Memory usage: ${memoryMB}MB / ${this.MAX_RAM_USAGE_MB}MB, Sessions: ${sessionCount}`);
     }
     
-    // Clean up if we exceed RAM limit OR session count limit
-    return memoryMB > this.MAX_RAM_USAGE_MB || sessionCount > this.MAX_ACTIVE_SESSIONS;
+    // Clean up only when RAM limit exceeded
+    return memoryMB > this.MAX_RAM_USAGE_MB;
   }
 
   private isSessionStable(userId: string): boolean {
@@ -1300,6 +1322,10 @@ export class WhatsAppService implements OnModuleInit {
 
   private async sendWebhook(userId: string, status: string, connected: boolean, user?: any): Promise<void> {
     try {
+      if (!this.WEBHOOK_URL) {
+        this.logger.warn('WEBHOOK_URL not set; skipping webhook call');
+        return;
+      }
       const sessionInfo = this.activeSessions.get(userId);
       const payload = {
         sessionId: `session_${userId}`,

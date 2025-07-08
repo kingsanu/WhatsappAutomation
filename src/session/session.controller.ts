@@ -13,6 +13,8 @@ import { WhatsAppService } from '../services/whatsapp.service';
 
 @Controller('session')
 export class SessionController {
+  private readonly QR_REFRESH_INTERVAL_MS = parseInt(process.env.QR_REFRESH_INTERVAL_MS || '600000');
+
   constructor(private readonly whatsappService: WhatsAppService) {}
 
   @Get('qr/:username/image')
@@ -31,6 +33,15 @@ export class SessionController {
             connectionStatus: status.connectionStatus
           }
         });
+      }
+
+      // Clear an existing session if it's older than the refresh interval
+      const sessionInfo = this.whatsappService.getSessionInfo(username);
+      if (sessionInfo) {
+        const ageMs = Date.now() - sessionInfo.lastUsed.getTime();
+        if (ageMs > this.QR_REFRESH_INTERVAL_MS) {
+          await this.whatsappService.clearUserSession(username);
+        }
       }
 
       let qrCode;
