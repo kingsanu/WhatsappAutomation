@@ -45,6 +45,7 @@ export class WhatsAppService implements OnModuleInit {
   private readonly MAX_RECONNECTION_ATTEMPTS = 3;
   private readonly MAX_CONFLICT_ATTEMPTS = 2; // Stop conflicts early
   private readonly QR_CODE_TIMEOUT = parseInt(process.env.QR_CODE_TIMEOUT || '60000');
+  private readonly WEBHOOK_URL = 'https://adstudioserver.foodyqueen.com/api/whatsapp-webhook';
 
   constructor(
     @InjectModel(AuthState.name)
@@ -487,6 +488,9 @@ export class WhatsAppService implements OnModuleInit {
             this.clearQRTimeout(userId);
             this.logger.log(`[${userId}] Reconnection successful for user ${userId}`);
             
+            // Send webhook notification for successful connection
+            await this.sendWebhook(userId, 'connected', true, socket.user);
+            
             try {
               await this.authStateModel.findOneAndUpdate(
                 { userId },
@@ -501,6 +505,9 @@ export class WhatsAppService implements OnModuleInit {
             } catch (dbError) {
               this.logger.error(`[${userId}] Error updating auth state:`, dbError);
             }
+
+            // Send webhook notification
+            this.sendWebhook(userId, 'connected', true, socket.user);
           } else if (connection === 'close') {
             this.logger.log(`[${userId}] Connection closed`);
             newSessionInfo.isConnected = false;
@@ -603,23 +610,22 @@ export class WhatsAppService implements OnModuleInit {
         });
 
         socket.ev.on('messages.upsert', (m) => {
-          // Handle incoming messages if needed
           this.logger.debug(`Received ${m.messages.length} messages for user ${userId}`);
         });
-      });
-      } catch (innerError) {
-        this.logger.error(`Error in session creation inner try block for user ${userId}:`, innerError);
-        throw innerError;
-      } finally {
-        // Always clear the progress flag
-        this.reconnectionInProgress.delete(userId);
-      }
-    } catch (error) {
-      this.logger.error(`Error creating session for user ${userId}:`, error);
+      }); // end of new Promise
+    } catch (innerError) {
+      this.logger.error(`Error in session creation inner try block for user ${userId}:`, innerError);
+      throw innerError;
+    } finally {
+      // Always clear the progress flag
       this.reconnectionInProgress.delete(userId);
-      await this.clearSession(userId);
-      throw error;
     }
+  } catch (error) {
+    this.logger.error(`Error creating session for user ${userId}:`, error);
+    this.reconnectionInProgress.delete(userId);
+    await this.clearSession(userId);
+    throw error;
+  }
   }
 
   private async attemptReconnection(userId: string, isPostPairingRestart = false, isConflictReconnect = false): Promise<void> {
@@ -764,6 +770,9 @@ export class WhatsAppService implements OnModuleInit {
           this.conflictAttempts.delete(userId); // Reset conflict attempts on successful connection
           this.reconnectionInProgress.delete(userId); // Clear reconnection progress flag
           
+          // Send webhook notification for successful reconnection
+          await this.sendWebhook(userId, 'connected', true, socket.user);
+          
           await this.authStateModel.findOneAndUpdate(
             { userId },
             { 
@@ -773,6 +782,9 @@ export class WhatsAppService implements OnModuleInit {
             },
             { upsert: true }
           );
+
+          // Send webhook notification
+          this.sendWebhook(userId, 'connected', true, socket.user);
         } else if (connection === 'close') {
           sessionInfo.isConnected = false;
           const errorStatusCode = (lastDisconnect?.error as any)?.output?.statusCode;
@@ -1058,6 +1070,9 @@ export class WhatsAppService implements OnModuleInit {
           sessionInfo.isReconnecting = false;
           this.reconnectionAttempts.delete(userId);
           
+          // Send webhook notification for existing session restoration
+          await this.sendWebhook(userId, 'connected', true, socket.user);
+          
           await this.authStateModel.findOneAndUpdate(
             { userId },
             { 
@@ -1067,6 +1082,9 @@ export class WhatsAppService implements OnModuleInit {
             },
             { upsert: true }
           );
+
+          // Send webhook notification
+          this.sendWebhook(userId, 'connected', true, socket.user);
         } else if (connection === 'close') {
           sessionInfo.isConnected = false;
           const errorStatusCode = (lastDisconnect?.error as any)?.output?.statusCode;
@@ -1277,6 +1295,43 @@ export class WhatsAppService implements OnModuleInit {
       sessionInfo.lastUsed = new Date();
       this.reconnectionInProgress.delete(userId);
       this.logger.log(`[${userId}] Session marked as stable`);
+    }
+  }
+
+  private async sendWebhook(userId: string, status: string, connected: boolean, user?: any): Promise<void> {
+    try {
+      const sessionInfo = this.activeSessions.get(userId);
+      const payload = {
+        sessionId: `session_${userId}`,
+        status,
+        connected,
+        connectionStatus: status,
+        user: user ? {
+          name: user.name || user.id || 'Unknown',
+          number: user.id || 'Unknown'
+        } : null,
+        data: {
+          isSessionActive: !!sessionInfo,
+          isReconnecting: sessionInfo?.isReconnecting || false,
+          reconnectionAttempts: this.reconnectionAttempts.get(userId) || 0
+        }
+      };
+
+      const response = await fetch(this.WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        this.logger.warn(`[${userId}] Webhook failed: ${response.status} ${response.statusText}`);
+      } else {
+        this.logger.log(`[${userId}] Webhook sent successfully for status: ${status}`);
+      }
+    } catch (error) {
+      this.logger.error(`[${userId}] Error sending webhook:`, error);
     }
   }
 }
