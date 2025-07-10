@@ -24,6 +24,10 @@ interface SessionInfo {
   isReconnecting?: boolean;
   isInitialConnection?: boolean;
   qrRetryCount?: number;
+  lastError?: string;
+  errorCount?: number;
+  circuitBreakerState?: 'closed' | 'open' | 'half-open';
+  lastCircuitBreakerReset?: Date;
 }
 
 @Injectable()
@@ -33,7 +37,7 @@ export class WhatsAppService implements OnModuleInit {
   private readonly pinoLogger = pino({
     level: process.env.NODE_ENV === 'development' ? 'debug' : 'warn',
     hooks: {
-      logMethod(args, method, levelLabel) {
+      logMethod(args, method, _levelLabel) {
         try {
           const msg = args[0];
           const text = typeof msg === 'string' ? msg : JSON.stringify(msg);
@@ -65,6 +69,12 @@ export class WhatsAppService implements OnModuleInit {
   // private readonly WEBHOOK_URL = 'https://adstudioserver.foodyqueen.com/api/whatsapp-webhook';
   // Webhook URL must be provided in environment; no default fallback
   private readonly WEBHOOK_URL = process.env.WEBHOOK_URL;
+
+  // Enhanced error handling constants
+  private readonly CIRCUIT_BREAKER_THRESHOLD = parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD || '5');
+  private readonly CIRCUIT_BREAKER_TIMEOUT = parseInt(process.env.CIRCUIT_BREAKER_TIMEOUT || '300000'); // 5 minutes
+  private readonly MAX_ERROR_COUNT = parseInt(process.env.MAX_ERROR_COUNT || '10');
+  private readonly ERROR_RESET_INTERVAL = parseInt(process.env.ERROR_RESET_INTERVAL || '3600000'); // 1 hour
 
   constructor(
     @InjectModel(AuthState.name)
@@ -169,7 +179,7 @@ export class WhatsAppService implements OnModuleInit {
       
       const savedData = await this.authStateModel.findOne({ userId });
       
-      let state;
+      let state: any;
       if (savedData?.credentials) {
         this.logger.log(`[${userId}] Found existing auth state in database`);
         
@@ -428,7 +438,7 @@ export class WhatsAppService implements OnModuleInit {
         });
 
         // Handle signal errors without crashing
-        socket.ev.on('creds.update', (update) => {
+        socket.ev.on('creds.update', (_update) => {
           try {
             saveCreds();
             this.logger.debug(`[${userId}] Credentials updated successfully`);
@@ -516,10 +526,16 @@ export class WhatsAppService implements OnModuleInit {
             try {
               await this.authStateModel.findOneAndUpdate(
                 { userId },
-                { 
-                  connectionStatus: 'connected', 
+                {
+                  connectionStatus: 'connected',
                   lastUpdated: new Date(),
-                  user: socket.user ? JSON.stringify(socket.user) : null
+                  lastConnected: new Date(),
+                  user: socket.user ? JSON.stringify(socket.user) : null,
+                  phoneNumber: socket.user?.id || null,
+                  deviceName: socket.user?.name || 'WhatsApp Web',
+                  isPersistent: true,
+                  autoReconnect: true,
+                  reconnectionAttempts: 0
                 },
                 { upsert: true }
               );
@@ -533,11 +549,16 @@ export class WhatsAppService implements OnModuleInit {
           } else if (connection === 'close') {
             this.logger.log(`[${userId}] Connection closed`);
             newSessionInfo.isConnected = false;
-            
+
             const errorStatusCode = (lastDisconnect?.error as any)?.output?.statusCode;
             const shouldReconnect = errorStatusCode !== DisconnectReason.loggedOut;
             const isRestartRequired = errorStatusCode === 515; // DisconnectReason.restartRequired
             const isConflict = errorStatusCode === 440; // Session conflict (logged in elsewhere)
+
+            // Handle connection error with enhanced error tracking
+            if (lastDisconnect?.error) {
+              this.handleSessionError(userId, lastDisconnect.error as Error, 'connection_close');
+            }
 
             this.logger.log(`[${userId}] Disconnect analysis:`, {
               errorStatusCode,
@@ -612,7 +633,13 @@ export class WhatsAppService implements OnModuleInit {
               // Connection lost, attempt reconnection
               await this.authStateModel.findOneAndUpdate(
                 { userId },
-                { connectionStatus: 'disconnected', lastUpdated: new Date() }
+                {
+                  connectionStatus: 'disconnected',
+                  lastUpdated: new Date(),
+                  lastDisconnected: new Date(),
+                  lastDisconnectReason: lastDisconnect?.error?.message || 'Connection lost',
+                  $inc: { reconnectionAttempts: 1 }
+                }
               );
               
               // Only attempt reconnection if not already in progress and not already reconnecting
@@ -627,7 +654,7 @@ export class WhatsAppService implements OnModuleInit {
           }
         });
 
-        socket.ev.on('creds.update', (update) => {
+        socket.ev.on('creds.update', (_update) => {
           this.logger.log(`Credentials updated for user ${userId}`);
         });
 
@@ -666,6 +693,12 @@ export class WhatsAppService implements OnModuleInit {
     // Check if session is already connected (prevent unnecessary reconnections)
     if (sessionInfo.isConnected && !isPostPairingRestart) {
       this.logger.log(`[${userId}] Session already connected, skipping reconnection`);
+      return;
+    }
+
+    // Enhanced error handling: Check circuit breaker and error limits
+    if (!isPostPairingRestart && !this.canAttemptReconnection(userId)) {
+      this.logger.log(`[${userId}] Reconnection blocked by error handling system`);
       return;
     }
 
@@ -719,13 +752,16 @@ export class WhatsAppService implements OnModuleInit {
                             isConflictReconnect ? 'conflict reconnection' : 'reconnection';
     
     this.logger.log(`Scheduling ${reconnectionType} for user ${userId} in ${delay}ms ${isPostPairingRestart ? '' : `(attempt ${attempts + 1})`}`);
-    
+
     setTimeout(async () => {
       try {
         await this.reconnectSession(userId);
       } catch (error) {
         this.logger.error(`${reconnectionType} failed for user ${userId}:`, error);
         sessionInfo.isReconnecting = false;
+
+        // Enhanced error handling
+        this.handleSessionError(userId, error as Error, reconnectionType);
       } finally {
         // Always clear the progress flag when done
         this.reconnectionInProgress.delete(userId);
@@ -772,7 +808,7 @@ export class WhatsAppService implements OnModuleInit {
         retryRequestDelayMs: 1000,
         maxMsgRetryCount: 3,
         emitOwnEvents: false,
-        getMessage: async (key) => {
+        getMessage: async (_key) => {
           return { conversation: '' };
         }
       });
@@ -791,16 +827,25 @@ export class WhatsAppService implements OnModuleInit {
           this.reconnectionAttempts.delete(userId);
           this.conflictAttempts.delete(userId); // Reset conflict attempts on successful connection
           this.reconnectionInProgress.delete(userId); // Clear reconnection progress flag
+
+          // Reset error tracking on successful reconnection
+          this.resetSessionErrors(userId);
           
           // Send webhook notification for successful reconnection
           await this.sendWebhook(userId, 'connected', true, socket.user);
           
           await this.authStateModel.findOneAndUpdate(
             { userId },
-            { 
-              connectionStatus: 'connected', 
+            {
+              connectionStatus: 'connected',
               lastUpdated: new Date(),
-              user: socket.user 
+              lastConnected: new Date(),
+              user: socket.user,
+              phoneNumber: socket.user?.id || null,
+              deviceName: socket.user?.name || 'WhatsApp Web',
+              reconnectionAttempts: 0,
+              isPersistent: true,
+              autoReconnect: true
             },
             { upsert: true }
           );
@@ -896,16 +941,36 @@ export class WhatsAppService implements OnModuleInit {
     try {
       const authState = await this.authStateModel.findOne({ userId });
       const sessionInfo = this.activeSessions.get(userId);
-      
+
+      // Validate actual socket connection status
+      const actualConnectionStatus = await this.validateSocketConnection(userId, sessionInfo);
+
+      // Update in-memory state if it doesn't match actual status
+      if (sessionInfo && sessionInfo.isConnected !== actualConnectionStatus.isConnected) {
+        this.logger.warn(`[${userId}] Session status mismatch detected. Memory: ${sessionInfo.isConnected}, Actual: ${actualConnectionStatus.isConnected}`);
+        sessionInfo.isConnected = actualConnectionStatus.isConnected;
+
+        // Update database to reflect actual status
+        await this.authStateModel.findOneAndUpdate(
+          { userId },
+          {
+            connectionStatus: actualConnectionStatus.isConnected ? 'connected' : 'disconnected',
+            lastUpdated: new Date()
+          }
+        );
+      }
+
       return {
         exists: !!authState,
-        connected: sessionInfo?.isConnected || false,
-        connectionStatus: sessionInfo?.isConnected ? 'connected' : (authState?.connectionStatus || 'disconnected'),
+        connected: actualConnectionStatus.isConnected,
+        connectionStatus: actualConnectionStatus.connectionStatus,
         lastUpdated: authState?.lastUpdated,
         user: authState?.user || sessionInfo?.socket?.user || null,
         isSessionActive: !!sessionInfo,
         isReconnecting: sessionInfo?.isReconnecting || false,
         reconnectionAttempts: this.reconnectionAttempts.get(userId) || 0,
+        socketState: actualConnectionStatus.socketState,
+        lastValidated: new Date(),
       };
     } catch (error) {
       this.logger.error(`Error getting session status for user ${userId}:`, error);
@@ -955,7 +1020,7 @@ export class WhatsAppService implements OnModuleInit {
           jid = `${to}@s.whatsapp.net`;
         }
 
-        let result;
+        let result: any;
 
         try {
           if (documentUrl) {
@@ -1020,24 +1085,62 @@ export class WhatsAppService implements OnModuleInit {
   async restoreExistingSessions(): Promise<void> {
     try {
       this.logger.log('Restoring existing sessions...');
+
+      // Find sessions that should be restored (connected or recently disconnected with auto-reconnect enabled)
       const existingSessions = await this.authStateModel.find({
-        connectionStatus: 'connected'
+        $or: [
+          { connectionStatus: 'connected' },
+          {
+            connectionStatus: { $in: ['disconnected', 'restarting_after_pairing'] },
+            autoReconnect: true,
+            isPersistent: true,
+            lastConnected: { $exists: true }
+          }
+        ]
       });
 
       this.logger.log(`Found ${existingSessions.length} existing sessions to restore`);
 
-      for (const session of existingSessions) {
+      // Restore sessions with staggered timing to avoid overwhelming the system
+      for (let i = 0; i < existingSessions.length; i++) {
+        const session = existingSessions[i];
         try {
-          this.logger.log(`Restoring session for user ${session.userId}`);
+          this.logger.log(`Restoring session for user ${session.userId} (${i + 1}/${existingSessions.length})`);
+
+          // Add delay between session restorations to prevent conflicts
+          if (i > 0) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+
           await this.activateExistingSession(session.userId);
-        } catch (error) {
-          this.logger.error(`Failed to restore session for ${session.userId}:`, error);
+
+          // Update session metadata
           await this.authStateModel.findOneAndUpdate(
             { userId: session.userId },
-            { connectionStatus: 'disconnected', lastUpdated: new Date() }
+            {
+              lastUpdated: new Date(),
+              reconnectionAttempts: 0
+            }
+          );
+
+        } catch (error) {
+          this.logger.error(`Failed to restore session for ${session.userId}:`, error);
+
+          // Update failure count and status
+          await this.authStateModel.findOneAndUpdate(
+            { userId: session.userId },
+            {
+              connectionStatus: 'disconnected',
+              lastUpdated: new Date(),
+              lastDisconnected: new Date(),
+              lastDisconnectReason: error.message,
+              $inc: { reconnectionAttempts: 1 }
+            }
           );
         }
       }
+
+      this.logger.log(`Session restoration completed. Active sessions: ${this.activeSessions.size}`);
     } catch (error) {
       this.logger.error('Error restoring existing sessions:', error);
     }
@@ -1068,7 +1171,7 @@ export class WhatsAppService implements OnModuleInit {
         retryRequestDelayMs: 1000,
         maxMsgRetryCount: 3,
         emitOwnEvents: false,
-        getMessage: async (key) => {
+        getMessage: async (_key) => {
           return { conversation: '' };
         }
       });
@@ -1097,10 +1200,16 @@ export class WhatsAppService implements OnModuleInit {
           
           await this.authStateModel.findOneAndUpdate(
             { userId },
-            { 
-              connectionStatus: 'connected', 
+            {
+              connectionStatus: 'connected',
               lastUpdated: new Date(),
-              user: socket.user 
+              lastConnected: new Date(),
+              user: socket.user,
+              phoneNumber: socket.user?.id || null,
+              deviceName: socket.user?.name || 'WhatsApp Web',
+              reconnectionAttempts: 0,
+              isPersistent: true,
+              autoReconnect: true
             },
             { upsert: true }
           );
@@ -1316,7 +1425,436 @@ export class WhatsAppService implements OnModuleInit {
       sessionInfo.isReconnecting = false;
       sessionInfo.lastUsed = new Date();
       this.reconnectionInProgress.delete(userId);
+
+      // Reset error tracking on successful connection
+      this.resetSessionErrors(userId);
+
       this.logger.log(`[${userId}] Session marked as stable`);
+    }
+  }
+
+  /**
+   * Validates the actual socket connection status by checking the socket state
+   * and attempting a lightweight operation to verify connectivity
+   */
+  private async validateSocketConnection(userId: string, sessionInfo?: SessionInfo): Promise<{
+    isConnected: boolean;
+    connectionStatus: string;
+    socketState: string;
+  }> {
+    if (!sessionInfo?.socket) {
+      return {
+        isConnected: false,
+        connectionStatus: 'disconnected',
+        socketState: 'no_socket'
+      };
+    }
+
+    try {
+      // Check socket connection state
+      const socket = sessionInfo.socket;
+
+      // Check if socket has WebSocket connection
+      const hasWebSocket = socket.ws && typeof socket.ws === 'object';
+      if (!hasWebSocket) {
+        return {
+          isConnected: false,
+          connectionStatus: 'disconnected',
+          socketState: 'no_websocket'
+        };
+      }
+
+      // Check WebSocket ready state (accessing the underlying WebSocket)
+      const wsReadyState = (socket.ws as any)?.readyState;
+
+      // WebSocket ready states: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+      if (wsReadyState !== 1) {
+        return {
+          isConnected: false,
+          connectionStatus: 'disconnected',
+          socketState: this.getSocketStateString(wsReadyState)
+        };
+      }
+
+      // Additional validation: check if socket is authenticated
+      if (!socket.user) {
+        return {
+          isConnected: false,
+          connectionStatus: 'unauthenticated',
+          socketState: 'open_but_unauthenticated'
+        };
+      }
+
+      // Socket appears to be connected and authenticated
+      return {
+        isConnected: true,
+        connectionStatus: 'connected',
+        socketState: 'open_and_authenticated'
+      };
+
+    } catch (error) {
+      this.logger.error(`[${userId}] Error validating socket connection:`, error);
+      return {
+        isConnected: false,
+        connectionStatus: 'validation_error',
+        socketState: 'error'
+      };
+    }
+  }
+
+  private getSocketStateString(state: number | undefined): string {
+    switch (state) {
+      case 0: return 'connecting';
+      case 1: return 'open';
+      case 2: return 'closing';
+      case 3: return 'closed';
+      default: return 'unknown';
+    }
+  }
+
+  /**
+   * Enhanced error handling with circuit breaker pattern
+   */
+  private handleSessionError(userId: string, error: Error, context: string): void {
+    const sessionInfo = this.activeSessions.get(userId);
+    if (!sessionInfo) return;
+
+    // Update error tracking
+    sessionInfo.lastError = error.message;
+    sessionInfo.errorCount = (sessionInfo.errorCount || 0) + 1;
+
+    this.logger.error(`[${userId}] Error in ${context}: ${error.message} (Error count: ${sessionInfo.errorCount})`);
+
+    // Check if circuit breaker should be triggered
+    if (sessionInfo.errorCount >= this.CIRCUIT_BREAKER_THRESHOLD) {
+      this.triggerCircuitBreaker(userId, sessionInfo);
+    }
+
+    // Update database with error information
+    this.authStateModel.findOneAndUpdate(
+      { userId },
+      {
+        lastDisconnected: new Date(),
+        lastDisconnectReason: `${context}: ${error.message}`,
+        $inc: { reconnectionAttempts: 1 }
+      }
+    ).catch(dbError => {
+      this.logger.error(`[${userId}] Failed to update error in database:`, dbError);
+    });
+  }
+
+  /**
+   * Trigger circuit breaker for a session
+   */
+  private triggerCircuitBreaker(userId: string, sessionInfo: SessionInfo): void {
+    sessionInfo.circuitBreakerState = 'open';
+    sessionInfo.lastCircuitBreakerReset = new Date();
+
+    this.logger.warn(`[${userId}] Circuit breaker triggered - too many errors (${sessionInfo.errorCount})`);
+
+    // Stop all reconnection attempts
+    sessionInfo.isReconnecting = false;
+    this.reconnectionInProgress.delete(userId);
+
+    // Schedule circuit breaker reset
+    setTimeout(() => {
+      this.resetCircuitBreaker(userId);
+    }, this.CIRCUIT_BREAKER_TIMEOUT);
+  }
+
+  /**
+   * Reset circuit breaker to half-open state
+   */
+  private resetCircuitBreaker(userId: string): void {
+    const sessionInfo = this.activeSessions.get(userId);
+    if (!sessionInfo) return;
+
+    sessionInfo.circuitBreakerState = 'half-open';
+    sessionInfo.errorCount = 0;
+
+    this.logger.log(`[${userId}] Circuit breaker reset to half-open state`);
+  }
+
+  /**
+   * Check if session can attempt reconnection based on circuit breaker state
+   */
+  private canAttemptReconnection(userId: string): boolean {
+    const sessionInfo = this.activeSessions.get(userId);
+    if (!sessionInfo) return false;
+
+    // Check circuit breaker state
+    if (sessionInfo.circuitBreakerState === 'open') {
+      this.logger.log(`[${userId}] Reconnection blocked - circuit breaker is open`);
+      return false;
+    }
+
+    // Check error count
+    if ((sessionInfo.errorCount || 0) >= this.MAX_ERROR_COUNT) {
+      this.logger.log(`[${userId}] Reconnection blocked - too many errors (${sessionInfo.errorCount})`);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Reset error count for a session (called on successful connection)
+   */
+  private resetSessionErrors(userId: string): void {
+    const sessionInfo = this.activeSessions.get(userId);
+    if (sessionInfo) {
+      sessionInfo.errorCount = 0;
+      sessionInfo.lastError = undefined;
+      sessionInfo.circuitBreakerState = 'closed';
+      sessionInfo.lastCircuitBreakerReset = undefined;
+    }
+  }
+
+  /**
+   * Enable or disable session persistence for a user
+   */
+  async setSessionPersistence(userId: string, isPersistent: boolean, autoReconnect: boolean = true): Promise<void> {
+    try {
+      await this.authStateModel.findOneAndUpdate(
+        { userId },
+        {
+          isPersistent,
+          autoReconnect,
+          lastUpdated: new Date()
+        },
+        { upsert: false }
+      );
+
+      this.logger.log(`[${userId}] Session persistence set to ${isPersistent}, auto-reconnect: ${autoReconnect}`);
+    } catch (error) {
+      this.logger.error(`[${userId}] Error setting session persistence:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get detailed session information including persistence settings
+   */
+  async getDetailedSessionInfo(userId: string): Promise<any> {
+    try {
+      const authState = await this.authStateModel.findOne({ userId });
+      const sessionInfo = this.activeSessions.get(userId);
+      const actualConnectionStatus = await this.validateSocketConnection(userId, sessionInfo);
+
+      return {
+        userId,
+        exists: !!authState,
+        connected: actualConnectionStatus.isConnected,
+        connectionStatus: actualConnectionStatus.connectionStatus,
+        socketState: actualConnectionStatus.socketState,
+        isSessionActive: !!sessionInfo,
+        isReconnecting: sessionInfo?.isReconnecting || false,
+        reconnectionAttempts: authState?.reconnectionAttempts || 0,
+        isPersistent: authState?.isPersistent || false,
+        autoReconnect: authState?.autoReconnect || false,
+        lastConnected: authState?.lastConnected,
+        lastDisconnected: authState?.lastDisconnected,
+        lastDisconnectReason: authState?.lastDisconnectReason,
+        phoneNumber: authState?.phoneNumber,
+        deviceName: authState?.deviceName,
+        user: authState?.user || sessionInfo?.socket?.user || null,
+        lastUpdated: authState?.lastUpdated,
+        createdAt: (authState as any)?.createdAt,
+        updatedAt: (authState as any)?.updatedAt,
+        sessionMetadata: authState?.sessionMetadata,
+        errorCount: sessionInfo?.errorCount || 0,
+        lastError: sessionInfo?.lastError,
+        circuitBreakerState: sessionInfo?.circuitBreakerState || 'closed'
+      };
+    } catch (error) {
+      this.logger.error(`Error getting detailed session info for user ${userId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all users with their session information
+   */
+  async getAllUsers(options: {
+    status?: 'connected' | 'disconnected' | 'all';
+    limit?: number;
+    offset?: number;
+    search?: string;
+  } = {}): Promise<any[]> {
+    try {
+      const { status = 'all', limit = 50, offset = 0, search } = options;
+
+      // Build query
+      let query: any = {};
+
+      if (status !== 'all') {
+        if (status === 'connected') {
+          query.connectionStatus = 'connected';
+        } else if (status === 'disconnected') {
+          query.connectionStatus = { $ne: 'connected' };
+        }
+      }
+
+      if (search) {
+        query.$or = [
+          { userId: { $regex: search, $options: 'i' } },
+          { phoneNumber: { $regex: search, $options: 'i' } },
+          { deviceName: { $regex: search, $options: 'i' } }
+        ];
+      }
+
+      // Get users from database
+      const authStates = await this.authStateModel
+        .find(query)
+        .sort({ lastUpdated: -1 })
+        .skip(offset)
+        .limit(limit)
+        .exec();
+
+      // Enhance with real-time session information
+      const users = await Promise.all(
+        authStates.map(async (authState) => {
+          const sessionInfo = this.activeSessions.get(authState.userId);
+          const actualConnectionStatus = await this.validateSocketConnection(authState.userId, sessionInfo);
+
+          return {
+            userId: authState.userId,
+            connected: actualConnectionStatus.isConnected,
+            connectionStatus: actualConnectionStatus.connectionStatus,
+            socketState: actualConnectionStatus.socketState,
+            isSessionActive: !!sessionInfo,
+            isReconnecting: sessionInfo?.isReconnecting || false,
+            reconnectionAttempts: authState.reconnectionAttempts || 0,
+            isPersistent: authState.isPersistent || false,
+            autoReconnect: authState.autoReconnect || false,
+            lastConnected: authState.lastConnected,
+            lastDisconnected: authState.lastDisconnected,
+            lastDisconnectReason: authState.lastDisconnectReason,
+            phoneNumber: authState.phoneNumber,
+            deviceName: authState.deviceName,
+            user: authState.user || sessionInfo?.socket?.user || null,
+            lastUpdated: authState.lastUpdated,
+            createdAt: (authState as any)?.createdAt,
+            updatedAt: (authState as any)?.updatedAt,
+            errorCount: sessionInfo?.errorCount || 0,
+            lastError: sessionInfo?.lastError,
+            circuitBreakerState: sessionInfo?.circuitBreakerState || 'closed'
+          };
+        })
+      );
+
+      return users;
+    } catch (error) {
+      this.logger.error('Error getting all users:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete a user completely (session and auth data)
+   */
+  async deleteUser(userId: string): Promise<void> {
+    try {
+      this.logger.log(`[${userId}] Deleting user completely`);
+
+      // Clear active session first
+      await this.clearUserSession(userId);
+
+      // Delete from database
+      await this.authStateModel.deleteOne({ userId });
+
+      // Clean up any remaining references
+      this.reconnectionAttempts.delete(userId);
+      this.conflictAttempts.delete(userId);
+      this.reconnectionInProgress.delete(userId);
+      this.qrCodes.delete(userId);
+      this.clearQRTimeout(userId);
+
+      this.logger.log(`[${userId}] User deleted successfully`);
+    } catch (error) {
+      this.logger.error(`[${userId}] Error deleting user:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get comprehensive system statistics
+   */
+  async getSystemStats(): Promise<any> {
+    try {
+      // Get database statistics
+      const totalUsers = await this.authStateModel.countDocuments();
+      const connectedUsers = await this.authStateModel.countDocuments({ connectionStatus: 'connected' });
+      const persistentUsers = await this.authStateModel.countDocuments({ isPersistent: true });
+      const autoReconnectUsers = await this.authStateModel.countDocuments({ autoReconnect: true });
+
+      // Get in-memory session statistics
+      const activeSessionCount = this.activeSessions.size;
+      const connectedSessionCount = Array.from(this.activeSessions.values())
+        .filter(session => session.isConnected).length;
+      const reconnectingSessionCount = Array.from(this.activeSessions.values())
+        .filter(session => session.isReconnecting).length;
+
+      // Get error statistics
+      const sessionsWithErrors = Array.from(this.activeSessions.values())
+        .filter(session => (session.errorCount || 0) > 0).length;
+      const circuitBreakerOpenCount = Array.from(this.activeSessions.values())
+        .filter(session => session.circuitBreakerState === 'open').length;
+
+      // Get memory usage
+      const memoryUsage = this.getMemoryUsageMB();
+
+      // Get recent activity
+      const recentlyActive = await this.authStateModel
+        .find({ lastUpdated: { $gte: new Date(Date.now() - 3600000) } }) // Last hour
+        .countDocuments();
+
+      return {
+        database: {
+          totalUsers,
+          connectedUsers,
+          disconnectedUsers: totalUsers - connectedUsers,
+          persistentUsers,
+          autoReconnectUsers,
+          recentlyActive
+        },
+        sessions: {
+          activeSessionCount,
+          connectedSessionCount,
+          disconnectedSessionCount: activeSessionCount - connectedSessionCount,
+          reconnectingSessionCount,
+          sessionsWithErrors,
+          circuitBreakerOpenCount
+        },
+        system: {
+          memoryUsageMB: memoryUsage,
+          maxMemoryMB: this.MAX_RAM_USAGE_MB,
+          memoryUtilization: ((memoryUsage / this.MAX_RAM_USAGE_MB) * 100).toFixed(2) + '%',
+          uptime: process.uptime(),
+          nodeVersion: process.version,
+          platform: process.platform
+        },
+        limits: {
+          maxActiveSessions: this.MAX_ACTIVE_SESSIONS,
+          maxReconnectionAttempts: this.MAX_RECONNECTION_ATTEMPTS,
+          maxConflictAttempts: this.MAX_CONFLICT_ATTEMPTS,
+          sessionIdleTimeout: this.SESSION_IDLE_TIMEOUT_MS,
+          circuitBreakerThreshold: this.CIRCUIT_BREAKER_THRESHOLD,
+          circuitBreakerTimeout: this.CIRCUIT_BREAKER_TIMEOUT
+        },
+        counters: {
+          totalReconnectionAttempts: Array.from(this.reconnectionAttempts.values())
+            .reduce((sum, attempts) => sum + attempts, 0),
+          totalConflictAttempts: Array.from(this.conflictAttempts.values())
+            .reduce((sum, attempts) => sum + attempts, 0),
+          reconnectionInProgress: this.reconnectionInProgress.size,
+          activeQRCodes: this.qrCodes.size
+        },
+        timestamp: new Date().toISOString()
+      };
+    } catch (error) {
+      this.logger.error('Error getting system statistics:', error);
+      throw error;
     }
   }
 
