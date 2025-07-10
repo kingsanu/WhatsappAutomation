@@ -164,4 +164,25 @@ export class SessionController {
       message: `Session start requested for user ${username}`
     };
   }
+
+  @Get('validate/:username')
+  async validateConnection(@Param('username') username: string) {
+    try {
+      const result = await this.whatsappService.forceValidateConnection(username);
+      return {
+        success: true,
+        data: result,
+        message: `Connection validation completed for user ${username}`
+      };
+    } catch (error) {
+      throw new HttpException(
+        {
+          status: HttpStatus.INTERNAL_SERVER_ERROR,
+          error: 'Failed to validate connection',
+          message: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
 }

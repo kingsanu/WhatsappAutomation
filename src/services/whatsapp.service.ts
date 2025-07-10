@@ -509,7 +509,7 @@ export class WhatsAppService implements OnModuleInit {
           }
 
           if (connection === 'open') {
-            this.logger.log(`[${userId}] WhatsApp connection opened successfully`);
+            this.logger.log(`[${userId}] WhatsApp connection opened successfully - QR scan completed`);
             this.markSessionAsStable(userId);
             connectionResolved = true;
             
@@ -942,22 +942,37 @@ export class WhatsAppService implements OnModuleInit {
       const authState = await this.authStateModel.findOne({ userId });
       const sessionInfo = this.activeSessions.get(userId);
 
+      // For initial connections, add a small delay to allow socket to stabilize
+      if (sessionInfo?.isInitialConnection && sessionInfo.isConnected) {
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
+      }
+
       // Validate actual socket connection status
       const actualConnectionStatus = await this.validateSocketConnection(userId, sessionInfo);
 
       // Update in-memory state if it doesn't match actual status
+      // But be careful during initial connections to avoid false negatives
       if (sessionInfo && sessionInfo.isConnected !== actualConnectionStatus.isConnected) {
-        this.logger.warn(`[${userId}] Session status mismatch detected. Memory: ${sessionInfo.isConnected}, Actual: ${actualConnectionStatus.isConnected}`);
-        sessionInfo.isConnected = actualConnectionStatus.isConnected;
+        // Don't update during initial connection process unless we're sure
+        if (!sessionInfo.isInitialConnection || actualConnectionStatus.connectionStatus === 'validation_error') {
+          this.logger.warn(`[${userId}] Session status mismatch detected. Memory: ${sessionInfo.isConnected}, Actual: ${actualConnectionStatus.isConnected}`);
+          sessionInfo.isConnected = actualConnectionStatus.isConnected;
 
-        // Update database to reflect actual status
-        await this.authStateModel.findOneAndUpdate(
-          { userId },
-          {
-            connectionStatus: actualConnectionStatus.isConnected ? 'connected' : 'disconnected',
-            lastUpdated: new Date()
+          // Update database to reflect actual status, but only for non-initial connections
+          // or when there's a clear error
+          if (!sessionInfo.isInitialConnection) {
+            await this.authStateModel.findOneAndUpdate(
+              { userId },
+              {
+                connectionStatus: actualConnectionStatus.isConnected ? 'connected' : 'disconnected',
+                lastUpdated: new Date()
+              }
+            );
           }
-        );
+        } else {
+          // During initial connection, log but don't update aggressively
+          this.logger.debug(`[${userId}] Initial connection in progress. Memory: ${sessionInfo.isConnected}, Socket: ${actualConnectionStatus.socketState}`);
+        }
       }
 
       return {
@@ -1423,13 +1438,14 @@ export class WhatsAppService implements OnModuleInit {
     if (sessionInfo) {
       sessionInfo.isConnected = true;
       sessionInfo.isReconnecting = false;
+      sessionInfo.isInitialConnection = false; // Clear initial connection flag
       sessionInfo.lastUsed = new Date();
       this.reconnectionInProgress.delete(userId);
 
       // Reset error tracking on successful connection
       this.resetSessionErrors(userId);
 
-      this.logger.log(`[${userId}] Session marked as stable`);
+      this.logger.log(`[${userId}] Session marked as stable and fully connected`);
     }
   }
 
@@ -1471,13 +1487,27 @@ export class WhatsAppService implements OnModuleInit {
       if (wsReadyState !== 1) {
         return {
           isConnected: false,
-          connectionStatus: 'disconnected',
+          connectionStatus: wsReadyState === 0 ? 'connecting' : 'disconnected',
           socketState: this.getSocketStateString(wsReadyState)
         };
       }
 
-      // Additional validation: check if socket is authenticated
-      if (!socket.user) {
+      // For initial connections (QR scanning), trust the in-memory state if socket is open
+      // This prevents false negatives during the authentication process
+      if (sessionInfo.isInitialConnection && sessionInfo.isConnected) {
+        this.logger.debug(`[${userId}] Initial connection detected - trusting in-memory state (connected: true)`);
+        return {
+          isConnected: true,
+          connectionStatus: 'connected',
+          socketState: 'open_initial_connection'
+        };
+      }
+
+      // For established sessions, check if socket is authenticated
+      // But be more lenient during the authentication process
+      if (!socket.user && !sessionInfo.isInitialConnection) {
+        // If this is not an initial connection and there's no user data,
+        // it might be a session that lost authentication
         return {
           isConnected: false,
           connectionStatus: 'unauthenticated',
@@ -1485,11 +1515,11 @@ export class WhatsAppService implements OnModuleInit {
         };
       }
 
-      // Socket appears to be connected and authenticated
+      // Socket appears to be connected (and either authenticated or in process)
       return {
         isConnected: true,
-        connectionStatus: 'connected',
-        socketState: 'open_and_authenticated'
+        connectionStatus: socket.user ? 'connected' : 'authenticating',
+        socketState: socket.user ? 'open_and_authenticated' : 'open_authenticating'
       };
 
     } catch (error) {
@@ -1630,6 +1660,25 @@ export class WhatsAppService implements OnModuleInit {
       this.logger.error(`[${userId}] Error setting session persistence:`, error);
       throw error;
     }
+  }
+
+  /**
+   * Force validation of socket connection (for debugging)
+   */
+  async forceValidateConnection(userId: string): Promise<any> {
+    const sessionInfo = this.activeSessions.get(userId);
+    const result = await this.validateSocketConnection(userId, sessionInfo);
+
+    this.logger.log(`[${userId}] Force validation result:`, {
+      isConnected: result.isConnected,
+      connectionStatus: result.connectionStatus,
+      socketState: result.socketState,
+      hasSocket: !!sessionInfo?.socket,
+      isInitialConnection: sessionInfo?.isInitialConnection,
+      inMemoryConnected: sessionInfo?.isConnected
+    });
+
+    return result;
   }
 
   /**
