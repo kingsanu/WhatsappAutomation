@@ -361,7 +361,7 @@ export class WhatsAppService implements OnModuleInit {
       }
 
       this.logger.log(`[${userId}] Creating WhatsApp socket with auth state...`);
-      
+
       const socket = makeWASocket({
         version,
         auth: state,
@@ -371,8 +371,8 @@ export class WhatsAppService implements OnModuleInit {
         syncFullHistory: false,
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: false,
-        defaultQueryTimeoutMs: 30000, // 30 seconds for better reliability
-        connectTimeoutMs: 30000, // 30 seconds connection timeout
+        defaultQueryTimeoutMs: 20000, // Reduced to 20 seconds
+        connectTimeoutMs: 20000, // Reduced to 20 seconds
         keepAliveIntervalMs: 45000, // Keep-alive every 45 seconds
         retryRequestDelayMs: 2000, // Shorter delay between retries
         maxMsgRetryCount: 1, // Minimal retry count to avoid conflicts
@@ -408,7 +408,7 @@ export class WhatsAppService implements OnModuleInit {
 
       this.activeSessions.set(userId, newSessionInfo);
 
-      return new Promise((resolve, reject) => {
+      return new Promise<string>((resolve, reject) => {
         let qrResolved = false;
         let connectionResolved = false;
 
@@ -466,7 +466,8 @@ export class WhatsAppService implements OnModuleInit {
         });
 
         socket.ev.on('connection.update', async (update) => {
-          const { connection, lastDisconnect, qr, isNewLogin, isOnline, receivedPendingNotifications } = update;
+          try {
+            const { connection, lastDisconnect, qr, isNewLogin, isOnline, receivedPendingNotifications } = update;
           
           // Log FULL connection update payload for debugging
           this.logger.log(`[${userId}] Connection update - Full payload:`, JSON.stringify({
@@ -652,6 +653,32 @@ export class WhatsAppService implements OnModuleInit {
           } else if (connection === 'connecting') {
             this.logger.log(`WhatsApp connecting for user ${userId}`);
           }
+          } catch (connectionError) {
+            this.logger.error(`[${userId}] Error in connection.update handler:`, connectionError);
+
+            // Handle the error gracefully without crashing the app
+            if (newSessionInfo) {
+              newSessionInfo.isConnected = false;
+              newSessionInfo.isReconnecting = false;
+            }
+
+            // Update database to reflect error state
+            try {
+              await this.authStateModel.findOneAndUpdate(
+                { userId },
+                {
+                  connectionStatus: 'disconnected',
+                  lastUpdated: new Date(),
+                  lastDisconnected: new Date(),
+                  lastDisconnectReason: connectionError.message || 'Connection handler error'
+                }
+              );
+            } catch (dbError) {
+              this.logger.error(`[${userId}] Failed to update database after connection error:`, dbError);
+            }
+
+            // Don't re-throw the error - let the session continue in error state
+          }
         });
 
         socket.ev.on('creds.update', (_update) => {
@@ -661,6 +688,10 @@ export class WhatsAppService implements OnModuleInit {
         socket.ev.on('messages.upsert', (m) => {
           this.logger.debug(`Received ${m.messages.length} messages for user ${userId}`);
         });
+      }).catch((promiseError) => {
+        this.logger.error(`[${userId}] Promise error in session creation:`, promiseError);
+        this.reconnectionInProgress.delete(userId);
+        throw promiseError;
       }); // end of new Promise
     } catch (innerError) {
       this.logger.error(`Error in session creation inner try block for user ${userId}:`, innerError);
@@ -818,7 +849,8 @@ export class WhatsAppService implements OnModuleInit {
 
       socket.ev.on('creds.update', saveCreds);
       socket.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        try {
+          const { connection, lastDisconnect } = update;
 
         if (connection === 'open') {
           this.logger.log(`Reconnection successful for user ${userId}`);
@@ -896,6 +928,30 @@ export class WhatsAppService implements OnModuleInit {
             this.attemptReconnection(userId);
           }
         }
+        } catch (connectionError) {
+          this.logger.error(`[${userId}] Error in reconnection connection.update handler:`, connectionError);
+
+          // Handle the error gracefully
+          if (sessionInfo) {
+            sessionInfo.isConnected = false;
+            sessionInfo.isReconnecting = false;
+          }
+
+          // Update database to reflect error state
+          try {
+            await this.authStateModel.findOneAndUpdate(
+              { userId },
+              {
+                connectionStatus: 'disconnected',
+                lastUpdated: new Date(),
+                lastDisconnected: new Date(),
+                lastDisconnectReason: connectionError.message || 'Reconnection handler error'
+              }
+            );
+          } catch (dbError) {
+            this.logger.error(`[${userId}] Failed to update database after reconnection error:`, dbError);
+          }
+        }
       });
 
     } catch (error) {
@@ -942,43 +998,51 @@ export class WhatsAppService implements OnModuleInit {
       const authState = await this.authStateModel.findOne({ userId });
       const sessionInfo = this.activeSessions.get(userId);
 
-      // For initial connections, add a small delay to allow socket to stabilize
-      if (sessionInfo?.isInitialConnection && sessionInfo.isConnected) {
-        await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
+      // Log session info for debugging
+      if (sessionInfo) {
+        this.logger.debug(`[${userId}] Session info: connected=${sessionInfo.isConnected}, initial=${sessionInfo.isInitialConnection}`);
       }
 
       // Validate actual socket connection status
       const actualConnectionStatus = await this.validateSocketConnection(userId, sessionInfo);
 
-      // Update in-memory state if it doesn't match actual status
-      // But be careful during initial connections to avoid false negatives
-      if (sessionInfo && sessionInfo.isConnected !== actualConnectionStatus.isConnected) {
-        // Don't update during initial connection process unless we're sure
-        if (!sessionInfo.isInitialConnection || actualConnectionStatus.connectionStatus === 'validation_error') {
-          this.logger.warn(`[${userId}] Session status mismatch detected. Memory: ${sessionInfo.isConnected}, Actual: ${actualConnectionStatus.isConnected}`);
-          sessionInfo.isConnected = actualConnectionStatus.isConnected;
+      // Only update if there's a clear disconnection (not during authentication process)
+      if (sessionInfo && actualConnectionStatus.connectionStatus === 'validation_error') {
+        this.logger.warn(`[${userId}] Session validation error detected`);
+        sessionInfo.isConnected = false;
 
-          // Update database to reflect actual status, but only for non-initial connections
-          // or when there's a clear error
-          if (!sessionInfo.isInitialConnection) {
-            await this.authStateModel.findOneAndUpdate(
-              { userId },
-              {
-                connectionStatus: actualConnectionStatus.isConnected ? 'connected' : 'disconnected',
-                lastUpdated: new Date()
-              }
-            );
+        await this.authStateModel.findOneAndUpdate(
+          { userId },
+          {
+            connectionStatus: 'disconnected',
+            lastUpdated: new Date(),
+            lastDisconnectReason: 'Validation error'
           }
-        } else {
-          // During initial connection, log but don't update aggressively
-          this.logger.debug(`[${userId}] Initial connection in progress. Memory: ${sessionInfo.isConnected}, Socket: ${actualConnectionStatus.socketState}`);
-        }
+        );
+      }
+
+      // Determine the final connection status
+      // For stable sessions (not initial), trust the validation result
+      // For initial connections, trust the in-memory state if it says connected
+      let finalConnected = actualConnectionStatus.isConnected;
+      let finalConnectionStatus = actualConnectionStatus.connectionStatus;
+
+      if (sessionInfo?.isInitialConnection === false && sessionInfo.isConnected) {
+        // This is a stable session that was marked as connected by the connection event
+        finalConnected = true;
+        finalConnectionStatus = 'connected';
+        this.logger.debug(`[${userId}] Using stable session state: connected`);
+      } else if (sessionInfo?.isInitialConnection && sessionInfo.isConnected) {
+        // This is an initial connection that was marked as connected
+        finalConnected = true;
+        finalConnectionStatus = 'connected';
+        this.logger.debug(`[${userId}] Using initial connection state: connected`);
       }
 
       return {
         exists: !!authState,
-        connected: actualConnectionStatus.isConnected,
-        connectionStatus: actualConnectionStatus.connectionStatus,
+        connected: finalConnected,
+        connectionStatus: finalConnectionStatus,
         lastUpdated: authState?.lastUpdated,
         user: authState?.user || sessionInfo?.socket?.user || null,
         isSessionActive: !!sessionInfo,
@@ -986,6 +1050,10 @@ export class WhatsAppService implements OnModuleInit {
         reconnectionAttempts: this.reconnectionAttempts.get(userId) || 0,
         socketState: actualConnectionStatus.socketState,
         lastValidated: new Date(),
+        // Debug information
+        inMemoryConnected: sessionInfo?.isConnected,
+        isInitialConnection: sessionInfo?.isInitialConnection,
+        validationResult: actualConnectionStatus.isConnected,
       };
     } catch (error) {
       this.logger.error(`Error getting session status for user ${userId}:`, error);
@@ -1202,7 +1270,8 @@ export class WhatsAppService implements OnModuleInit {
 
       socket.ev.on('creds.update', saveCreds);
       socket.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        try {
+          const { connection, lastDisconnect } = update;
 
         if (connection === 'open') {
           this.logger.log(`Existing session restored for user: ${userId}`);
@@ -1265,6 +1334,30 @@ export class WhatsAppService implements OnModuleInit {
             if (!sessionInfo.isReconnecting) {
               this.attemptReconnection(userId);
             }
+          }
+        }
+        } catch (connectionError) {
+          this.logger.error(`[${userId}] Error in existing session connection.update handler:`, connectionError);
+
+          // Handle the error gracefully
+          if (sessionInfo) {
+            sessionInfo.isConnected = false;
+            sessionInfo.isReconnecting = false;
+          }
+
+          // Update database to reflect error state
+          try {
+            await this.authStateModel.findOneAndUpdate(
+              { userId },
+              {
+                connectionStatus: 'disconnected',
+                lastUpdated: new Date(),
+                lastDisconnected: new Date(),
+                lastDisconnectReason: connectionError.message || 'Existing session handler error'
+              }
+            );
+          } catch (dbError) {
+            this.logger.error(`[${userId}] Failed to update database after existing session error:`, dbError);
           }
         }
       });
@@ -1369,18 +1462,28 @@ export class WhatsAppService implements OnModuleInit {
 
   async clearAllSessions(): Promise<void> {
     this.logger.log('Clearing all active sessions for recovery...');
-    
+
     const userIds = Array.from(this.activeSessions.keys());
     for (const userId of userIds) {
-      await this.clearSession(userId);
+      try {
+        await this.clearSession(userId);
+        this.logger.log(`[${userId}] Session cleared`);
+      } catch (error) {
+        this.logger.error(`[${userId}] Error clearing session:`, error);
+      }
     }
-    
+
     // Clear all tracking maps
     this.reconnectionAttempts.clear();
     this.conflictAttempts.clear();
     this.reconnectionInProgress.clear();
     this.qrCodes.clear();
-    
+
+    // Clear all QR timeouts
+    for (const userId of userIds) {
+      this.clearQRTimeout(userId);
+    }
+
     this.logger.log(`Cleared ${userIds.length} sessions`);
   }
 
@@ -1492,34 +1595,41 @@ export class WhatsAppService implements OnModuleInit {
         };
       }
 
-      // For initial connections (QR scanning), trust the in-memory state if socket is open
-      // This prevents false negatives during the authentication process
-      if (sessionInfo.isInitialConnection && sessionInfo.isConnected) {
-        this.logger.debug(`[${userId}] Initial connection detected - trusting in-memory state (connected: true)`);
+      // If the session info says it's connected, and the socket is open, trust it
+      // This is more reliable than checking user data which might not be immediately available
+      if (sessionInfo.isConnected && wsReadyState === 1) {
+        this.logger.debug(`[${userId}] Socket is open and session marked as connected - trusting session state`);
         return {
           isConnected: true,
           connectionStatus: 'connected',
-          socketState: 'open_initial_connection'
+          socketState: socket.user ? 'open_and_authenticated' : 'open_authenticating'
         };
       }
 
-      // For established sessions, check if socket is authenticated
-      // But be more lenient during the authentication process
-      if (!socket.user && !sessionInfo.isInitialConnection) {
-        // If this is not an initial connection and there's no user data,
-        // it might be a session that lost authentication
-        return {
-          isConnected: false,
-          connectionStatus: 'unauthenticated',
-          socketState: 'open_but_unauthenticated'
-        };
+      // If socket is open but session not marked as connected, check authentication
+      if (wsReadyState === 1) {
+        if (socket.user) {
+          // Socket is open and authenticated
+          return {
+            isConnected: true,
+            connectionStatus: 'connected',
+            socketState: 'open_and_authenticated'
+          };
+        } else {
+          // Socket is open but not yet authenticated (might be in process)
+          return {
+            isConnected: false,
+            connectionStatus: 'authenticating',
+            socketState: 'open_authenticating'
+          };
+        }
       }
 
-      // Socket appears to be connected (and either authenticated or in process)
+      // Socket is not open
       return {
-        isConnected: true,
-        connectionStatus: socket.user ? 'connected' : 'authenticating',
-        socketState: socket.user ? 'open_and_authenticated' : 'open_authenticating'
+        isConnected: false,
+        connectionStatus: 'disconnected',
+        socketState: this.getSocketStateString(wsReadyState)
       };
 
     } catch (error) {
@@ -1822,6 +1932,38 @@ export class WhatsAppService implements OnModuleInit {
       this.logger.log(`[${userId}] User deleted successfully`);
     } catch (error) {
       this.logger.error(`[${userId}] Error deleting user:`, error);
+      throw error;
+    }
+  }
+
+
+
+  /**
+   * Clear only conflicted sessions
+   */
+  async clearConflictedSessions(): Promise<void> {
+    try {
+      this.logger.log('Clearing conflicted sessions...');
+
+      const conflictedUsers = Array.from(this.conflictAttempts.keys());
+      let clearedCount = 0;
+
+      for (const userId of conflictedUsers) {
+        try {
+          await this.clearUserSession(userId);
+          this.conflictAttempts.delete(userId);
+          this.reconnectionAttempts.delete(userId);
+          this.reconnectionInProgress.delete(userId);
+          this.logger.log(`[${userId}] Conflicted session cleared`);
+          clearedCount++;
+        } catch (error) {
+          this.logger.error(`[${userId}] Error clearing conflicted session:`, error);
+        }
+      }
+
+      this.logger.log(`Cleared ${clearedCount} conflicted sessions`);
+    } catch (error) {
+      this.logger.error('Error clearing conflicted sessions:', error);
       throw error;
     }
   }

@@ -185,4 +185,44 @@ export class SessionController {
       );
     }
   }
+
+  @Delete('clear-all')
+  async clearAllSessions() {
+    try {
+      await this.whatsappService.clearAllSessions();
+      return {
+        success: true,
+        message: 'All sessions cleared successfully'
+      };
+    } catch (error) {
+      throw new HttpException(
+        {
+          status: HttpStatus.INTERNAL_SERVER_ERROR,
+          error: 'Failed to clear sessions',
+          message: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Delete('clear-conflicts')
+  async clearConflictedSessions() {
+    try {
+      await this.whatsappService.clearConflictedSessions();
+      return {
+        success: true,
+        message: 'Conflicted sessions cleared successfully'
+      };
+    } catch (error) {
+      throw new HttpException(
+        {
+          status: HttpStatus.INTERNAL_SERVER_ERROR,
+          error: 'Failed to clear conflicted sessions',
+          message: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
 }
