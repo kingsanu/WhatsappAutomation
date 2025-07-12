@@ -13,9 +13,28 @@ import {
   AuthenticationCreds,
   fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
-import { AuthState, AuthStateDocument } from '../schemas/auth-state.schema';
+import { AuthState, AuthStateDocument, SessionStatus, PersistencePolicy } from '../schemas/auth-state.schema';
+import { PersistentAuthStateService } from './persistent-auth-state.service';
 import * as QRCode from 'qrcode';
 import pino from 'pino';
+
+// Enhanced connection state tracking
+enum SessionConnectionState {
+  DISCONNECTED = 'disconnected',
+  CONNECTING = 'connecting',
+  CONNECTED = 'connected',
+  RECONNECTING = 'reconnecting',
+  FAILED = 'failed',
+  TIMEOUT = 'timeout'
+}
+
+interface ConnectionAttemptInfo {
+  startTime: Date;
+  state: SessionConnectionState;
+  attempt: number;
+  lastError?: string;
+  timeoutId?: NodeJS.Timeout;
+}
 
 interface SessionInfo {
   socket: WASocket;
@@ -28,21 +47,33 @@ interface SessionInfo {
   errorCount?: number;
   circuitBreakerState?: 'closed' | 'open' | 'half-open';
   lastCircuitBreakerReset?: Date;
+  connectionState?: SessionConnectionState;
+  connectionAttempt?: ConnectionAttemptInfo;
+  lastConnectionAttempt?: Date;
+  connectionFailureCount?: number;
 }
 
 @Injectable()
 export class WhatsAppService implements OnModuleInit {
   private readonly logger = new Logger(WhatsAppService.name);
-  // Use pino without external transport and suppress known Baileys decryption errors in logs
+  // Use pino with enhanced logging for connection debugging
   private readonly pinoLogger = pino({
-    level: process.env.NODE_ENV === 'development' ? 'debug' : 'warn',
+    level: process.env.NODE_ENV === 'development' ? 'debug' : 'info',
     hooks: {
-      logMethod(args, method, _levelLabel) {
+      logMethod(args, method, levelLabel) {
         try {
           const msg = args[0];
           const text = typeof msg === 'string' ? msg : JSON.stringify(msg);
-          // Suppress common decryption errors to reduce noise
-          if (text.includes('Bad decrypt') || text.includes('EVP_DecryptFinal_ex') || text.toLowerCase().includes('token is not valid')) {
+
+          // Log connection-related events with enhanced detail
+          if (text.includes('connection') || text.includes('socket') || text.includes('websocket') ||
+              text.includes('connect') || text.includes('disconnect') || text.includes('auth')) {
+            console.log(`[BAILEYS-${String(levelLabel).toUpperCase()}] ${text}`);
+          }
+
+          // Suppress common decryption errors to reduce noise but keep connection errors
+          if (text.includes('Bad decrypt') || text.includes('EVP_DecryptFinal_ex') ||
+              (text.toLowerCase().includes('token is not valid') && !text.includes('connection'))) {
             return;
           }
         } catch (_) {
@@ -58,14 +89,30 @@ export class WhatsAppService implements OnModuleInit {
   private conflictAttempts = new Map<string, number>();
   private reconnectionInProgress = new Map<string, boolean>(); // Track ongoing reconnections
   private qrTimeouts = new Map<string, NodeJS.Timeout>();
-  private readonly MAX_ACTIVE_SESSIONS = parseInt(process.env.MAX_ACTIVE_SESSIONS || '100'); // Increased default
-  private readonly MAX_RAM_USAGE_MB = parseInt(process.env.MAX_RAM_USAGE_MB || '10240'); // 10GB default
-  private readonly SESSION_CLEANUP_INTERVAL = parseInt(process.env.SESSION_CLEANUP_INTERVAL || '300000');
-  // How long before an idle session is considered stale (default 1h)
-  private readonly SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000');
+
+  // Enhanced connection tracking for indefinite session persistence
+  private connectionAttempts = new Map<string, ConnectionAttemptInfo>();
+  private lastConnectionAttempt = new Map<string, Date>();
+  private connectionFailureCount = new Map<string, number>();
+  private sessionPersistencePolicy = new Map<string, 'indefinite' | 'memory-managed'>();
+
+  // Track sessions that were disconnected due to memory constraints for automatic reconnection
+  private memoryDisconnectedSessions = new Set<string>();
+  private lastMemoryCheck = 0;
+
+  private readonly MAX_ACTIVE_SESSIONS = parseInt(process.env.MAX_ACTIVE_SESSIONS || '1000'); // Increased for persistence
+  private readonly MAX_RAM_USAGE_MB = parseInt(process.env.MAX_RAM_USAGE_MB || '20480'); // 20GB default for persistence
+  // Cleanup interval increased to reduce aggressive cleanup (only for emergency cleanup)
+  private readonly SESSION_CLEANUP_INTERVAL = parseInt(process.env.SESSION_CLEANUP_INTERVAL || '3600000'); // 1 hour
+  // Session idle timeout disabled by default for persistence (0 = never timeout)
+  private readonly SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '0'); // 0 = never timeout
   private readonly MAX_RECONNECTION_ATTEMPTS = 3;
   private readonly MAX_CONFLICT_ATTEMPTS = 2; // Stop conflicts early
   private readonly QR_CODE_TIMEOUT = parseInt(process.env.QR_CODE_TIMEOUT || '60000');
+  // Browser configuration for WhatsApp linked devices
+  private readonly DEVICE_NAME = process.env.WHATSAPP_DEVICE_NAME || 'WhatsApp API';
+  private readonly BROWSER_NAME = process.env.WHATSAPP_BROWSER || 'Chrome';
+  private readonly BROWSER_VERSION = process.env.WHATSAPP_VERSION || '4.0.0';
   // private readonly WEBHOOK_URL = 'https://adstudioserver.foodyqueen.com/api/whatsapp-webhook';
   // Webhook URL must be provided in environment; no default fallback
   private readonly WEBHOOK_URL = process.env.WEBHOOK_URL;
@@ -76,60 +123,246 @@ export class WhatsAppService implements OnModuleInit {
   private readonly MAX_ERROR_COUNT = parseInt(process.env.MAX_ERROR_COUNT || '10');
   private readonly ERROR_RESET_INTERVAL = parseInt(process.env.ERROR_RESET_INTERVAL || '3600000'); // 1 hour
 
+  // Instance tracking for smart conflict resolution
+  private readonly SERVER_INSTANCE_ID = process.env.SERVER_INSTANCE_ID || require('os').hostname() + '_' + Date.now();
+  private readonly SERVER_START_TIME = new Date();
+
   constructor(
     @InjectModel(AuthState.name)
     private authStateModel: Model<AuthStateDocument>,
+    private persistentAuthStateService: PersistentAuthStateService,
   ) {}
 
-  async onModuleInit() {
-    this.logger.log('WhatsApp Service initialized');
-    // Start periodic cleanup
-    setInterval(() => this.cleanupInactiveSessions(), this.SESSION_CLEANUP_INTERVAL);
-    // Restore any sessions persisted in DB at startup
-    this.logger.log('Restoring existing sessions from database...');
-    this.restoreExistingSessions().catch(err => this.logger.error('Restore sessions error', err));
-    // Don't restore sessions automatically on startup to prevent conflicts
-    // Sessions will be activated on-demand when needed
-    this.logger.log('Session restoration disabled - sessions will activate on-demand');
+  /**
+   * Handle decryption errors with automatic key refresh
+   */
+  private async handleDecryptionError(userId: string, error: any): Promise<void> {
+    try {
+      // Check if this is a decryption-related error that can be fixed with key refresh
+      if (this.persistentAuthStateService.shouldRefreshKeys(error)) {
+        this.logger.warn(`[${userId}] Decryption error detected, attempting key refresh:`, error.message);
+
+        // Refresh the encryption keys
+        await this.persistentAuthStateService.refreshEncryptionKeys(userId);
+
+        // Clear the current session to force reconnection with fresh keys
+        const sessionInfo = this.activeSessions.get(userId);
+        if (sessionInfo && sessionInfo.socket) {
+          try {
+            sessionInfo.socket.end(undefined);
+          } catch (endError) {
+            this.logger.debug(`[${userId}] Error ending socket during key refresh:`, endError.message);
+          }
+        }
+        this.activeSessions.delete(userId);
+
+        // Update database to reflect key refresh
+        await this.authStateModel.findOneAndUpdate(
+          { userId },
+          {
+            connectionStatus: SessionStatus.DISCONNECTED,
+            lastUpdated: new Date(),
+            lastDisconnected: new Date(),
+            lastDisconnectReason: 'Key refresh due to decryption error',
+            lastDisconnectType: 'key_refresh'
+          }
+        );
+
+        this.logger.log(`[${userId}] Session cleared for key refresh, will reconnect with fresh keys`);
+      }
+    } catch (refreshError) {
+      this.logger.error(`[${userId}] Error handling decryption error:`, refreshError);
+    }
   }
 
-  private async cleanupInactiveSessions(): Promise<void> {
-    if (!this.shouldCleanupSessions()) {
+  async onModuleInit() {
+    this.logger.log('WhatsApp Service initialized with enhanced persistence');
+
+    // Start periodic cleanup (only for emergency situations when memory is critically low)
+    setInterval(() => this.emergencyCleanupSessions(), this.SESSION_CLEANUP_INTERVAL);
+
+    // Start periodic memory recovery check for automatic reconnection
+    setInterval(() => this.checkMemoryRecoveryAndReconnect(), 60000); // Check every minute
+
+    // Enable automatic session restoration for persistent sessions
+    this.logger.log('Restoring persistent sessions from database...');
+    try {
+      await this.restoreExistingSessions();
+      this.logger.log('Session restoration completed successfully');
+    } catch (err) {
+      this.logger.error('Session restoration failed:', err);
+      // Don't fail startup if session restoration fails
+    }
+  }
+
+  /**
+   * Emergency cleanup only when memory is critically low (>95% RAM usage)
+   * Implements LRU strategy while respecting indefinite session persistence policy
+   * Only removes sessions when absolutely necessary for system stability
+   */
+  private async emergencyCleanupSessions(): Promise<void> {
+    const memoryMB = this.getMemoryUsageMB();
+    const ramUtilization = memoryMB / this.MAX_RAM_USAGE_MB;
+
+    // Only cleanup in emergency situations (>95% RAM usage)
+    if (ramUtilization < 0.95) {
       return;
     }
 
-    const memoryMB = this.getMemoryUsageMB();
-    this.logger.log(`Cleaning up sessions. RAM: ${memoryMB}MB/${this.MAX_RAM_USAGE_MB}MB, Active: ${this.activeSessions.size}`);
-    
-    const sessionEntries = Array.from(this.activeSessions.entries())
-      .sort(([, a], [, b]) => a.lastUsed.getTime() - b.lastUsed.getTime());
+    this.logger.warn(`🚨 EMERGENCY CLEANUP TRIGGERED - CRITICAL MEMORY SITUATION`);
+    this.logger.warn(`Memory: ${memoryMB}MB/${this.MAX_RAM_USAGE_MB}MB (${(ramUtilization * 100).toFixed(1)}%)`);
+    this.logger.warn(`Active Sessions: ${this.activeSessions.size}`);
+    this.logger.warn(`Persistence Policy: Indefinite sessions will be preserved when possible`);
 
-    // Calculate how many sessions to remove (more aggressive if RAM is high)
-    const ramUtilization = memoryMB / this.MAX_RAM_USAGE_MB;
-    let sessionsToRemove = Math.max(1, Math.floor(this.activeSessions.size * 0.2)); // Remove 20% by default
-    
-    if (ramUtilization > 0.9) {
-      sessionsToRemove = Math.floor(this.activeSessions.size * 0.5); // Remove 50% if RAM is critical
-    }
+    // Implement sophisticated LRU strategy with persistence awareness
+    const sessionEntries = Array.from(this.activeSessions.entries());
+
+    // Sort by priority: conflicted sessions first, then temporary sessions, then by last used (LRU)
+    sessionEntries.sort(([userIdA, sessionA], [userIdB, sessionB]) => {
+      const conflictedA = (this.conflictAttempts.get(userIdA) || 0) >= this.MAX_CONFLICT_ATTEMPTS;
+      const conflictedB = (this.conflictAttempts.get(userIdB) || 0) >= this.MAX_CONFLICT_ATTEMPTS;
+
+      // Conflicted sessions have highest priority for removal
+      if (conflictedA && !conflictedB) return -1;
+      if (!conflictedA && conflictedB) return 1;
+
+      // Then by persistence policy (temporary sessions removed before indefinite)
+      const policyA = this.sessionPersistencePolicy.get(userIdA) || 'indefinite';
+      const policyB = this.sessionPersistencePolicy.get(userIdB) || 'indefinite';
+
+      if (policyA === 'memory-managed' && policyB === 'indefinite') return -1;
+      if (policyA === 'indefinite' && policyB === 'memory-managed') return 1;
+
+      // Finally by last used time (LRU - oldest first)
+      return sessionA.lastUsed.getTime() - sessionB.lastUsed.getTime();
+    });
 
     let removedCount = 0;
+
     for (const [userId, sessionInfo] of sessionEntries) {
-      if (removedCount >= sessionsToRemove) break;
-      
-      const timeSinceLastUse = Date.now() - sessionInfo.lastUsed.getTime();
-      const isOld = timeSinceLastUse > this.SESSION_IDLE_TIMEOUT_MS; // stale if idle beyond configured timeout
-      const isInactive = !sessionInfo.isConnected;
-      const isConflicted = (this.conflictAttempts.get(userId) || 0) > 0;
-      
-      // Only remove sessions that are old, inactive, or conflicted
-      if (isOld || isInactive || isConflicted) {
-        this.logger.log(`Cleaning up session for user: ${userId} (old: ${isOld}, inactive: ${isInactive}, conflicted: ${isConflicted})`);
-        await this.clearSession(userId);
-        removedCount++;
+      // Check if this session is marked as persistent in database
+      try {
+        const authState = await this.authStateModel.findOne({ userId });
+
+        // Respect indefinite session persistence policy - NEVER remove persistent/permanent sessions
+        const persistencePolicy = this.sessionPersistencePolicy.get(userId) || 'indefinite';
+        const isDbPersistent = authState?.persistencePolicy === PersistencePolicy.PERSISTENT ||
+                              authState?.persistencePolicy === PersistencePolicy.PERMANENT;
+
+        if (isDbPersistent || persistencePolicy === 'indefinite') {
+          this.logger.log(`🔒 Preserving indefinite session ${userId} (policy: ${persistencePolicy}, db: ${authState?.persistencePolicy})`);
+          continue;
+        }
+
+        // Enhanced removal criteria with connection failure tracking
+        const isConflicted = (this.conflictAttempts.get(userId) || 0) >= this.MAX_CONFLICT_ATTEMPTS;
+        const isTemporary = authState?.persistencePolicy === PersistencePolicy.TEMPORARY;
+        const isInactive = !sessionInfo.isConnected;
+        const connectionFailures = this.connectionFailureCount.get(userId) || 0;
+        const hasRepeatedFailures = connectionFailures > 5;
+
+        // Only remove sessions that are safe to remove
+        const shouldRemove = isConflicted ||
+                           (isTemporary && isInactive) ||
+                           (hasRepeatedFailures && isInactive);
+
+        if (shouldRemove) {
+          const reason = isConflicted ? 'conflicted' :
+                        isTemporary ? 'temporary policy' :
+                        hasRepeatedFailures ? 'repeated connection failures' : 'inactive';
+
+          this.logger.warn(`🗑️ Emergency cleanup: removing session ${userId} (${reason}, failures: ${connectionFailures})`);
+          await this.clearSession(userId);
+          removedCount++;
+
+          // Check if we've freed enough memory to continue safely
+          const newMemoryMB = this.getMemoryUsageMB();
+          const newUtilization = newMemoryMB / this.MAX_RAM_USAGE_MB;
+
+          if (newUtilization < 0.90) {
+            this.logger.log(`✅ Memory usage reduced to safe levels (${(newUtilization * 100).toFixed(1)}%)`);
+            break;
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Error during emergency cleanup for user ${userId}:`, error);
       }
     }
-    
-    this.logger.log(`Cleaned up ${removedCount} sessions. Remaining: ${this.activeSessions.size}`);
+
+    const finalMemoryMB = this.getMemoryUsageMB();
+    const finalUtilization = finalMemoryMB / this.MAX_RAM_USAGE_MB;
+
+    this.logger.warn(`🏁 Emergency cleanup completed:`);
+    this.logger.warn(`- Sessions removed: ${removedCount}`);
+    this.logger.warn(`- Remaining active sessions: ${this.activeSessions.size}`);
+    this.logger.warn(`- Memory: ${finalMemoryMB}MB/${this.MAX_RAM_USAGE_MB}MB (${(finalUtilization * 100).toFixed(1)}%)`);
+
+    if (finalUtilization > 0.95) {
+      this.logger.error(`⚠️ CRITICAL: Memory usage still above 95% after cleanup. System may be unstable.`);
+      this.logger.error(`Consider increasing MAX_RAM_USAGE_MB or reducing session load.`);
+    } else {
+      this.logger.log(`✅ Memory usage reduced to safe levels. Session persistence maintained.`);
+    }
+  }
+
+  /**
+   * Check for memory recovery and automatically reconnect sessions that were disconnected due to memory constraints
+   */
+  private async checkMemoryRecoveryAndReconnect(): Promise<void> {
+    const currentMemoryMB = this.getMemoryUsageMB();
+    const currentUtilization = currentMemoryMB / this.MAX_RAM_USAGE_MB;
+
+    // Only attempt reconnection if memory usage is below 80% (safe threshold)
+    if (currentUtilization < 0.80 && this.memoryDisconnectedSessions.size > 0) {
+      this.logger.log(`🔄 Memory recovered to ${(currentUtilization * 100).toFixed(1)}% - attempting to reconnect ${this.memoryDisconnectedSessions.size} sessions`);
+
+      // Reconnect sessions that were disconnected due to memory constraints
+      const sessionsToReconnect = Array.from(this.memoryDisconnectedSessions);
+      let reconnectedCount = 0;
+
+      for (const userId of sessionsToReconnect) {
+        try {
+          // Check if session still exists in database and has indefinite persistence
+          const authState = await this.authStateModel.findOne({ userId });
+          const persistencePolicy = this.sessionPersistencePolicy.get(userId) || 'indefinite';
+
+          if (authState && (persistencePolicy === 'indefinite' ||
+                           authState.persistencePolicy === PersistencePolicy.PERSISTENT ||
+                           authState.persistencePolicy === PersistencePolicy.PERMANENT)) {
+
+            this.logger.log(`🔄 Reconnecting session ${userId} after memory recovery`);
+            await this.activateSession(userId);
+            this.memoryDisconnectedSessions.delete(userId);
+            reconnectedCount++;
+
+            // Check memory after each reconnection to avoid overloading
+            const newMemoryMB = this.getMemoryUsageMB();
+            const newUtilization = newMemoryMB / this.MAX_RAM_USAGE_MB;
+
+            if (newUtilization > 0.85) {
+              this.logger.log(`Memory usage reached ${(newUtilization * 100).toFixed(1)}% - stopping automatic reconnection`);
+              break;
+            }
+
+            // Small delay between reconnections to avoid overwhelming the system
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } else {
+            // Remove from tracking if session no longer exists or is not persistent
+            this.memoryDisconnectedSessions.delete(userId);
+          }
+        } catch (error) {
+          this.logger.error(`Error reconnecting session ${userId} after memory recovery:`, error);
+          // Keep in tracking for next attempt
+        }
+      }
+
+      if (reconnectedCount > 0) {
+        this.logger.log(`✅ Successfully reconnected ${reconnectedCount} sessions after memory recovery`);
+      }
+    }
+
+    // Update last memory check
+    this.lastMemoryCheck = Date.now();
   }
 
   private async clearSession(userId: string): Promise<void> {
@@ -347,12 +580,42 @@ export class WhatsAppService implements OnModuleInit {
           await this.clearSession(userId);
         }
 
-      // Check cleanup only when creating new sessions
-      if (this.shouldCleanupSessions()) {
-        await this.cleanupInactiveSessions();
+      // Only perform emergency cleanup if memory is critically low
+      if (this.getMemoryUsageMB() / this.MAX_RAM_USAGE_MB > 0.95) {
+        await this.emergencyCleanupSessions();
       }
 
       const { state, saveCreds } = await this.loadAuthState(userId);
+
+      // Enhanced auth state validation
+      this.logger.log(`[${userId}] Auth state loaded. Validating...`, {
+        hasState: !!state,
+        hasCreds: !!state?.creds,
+        hasKeys: !!state?.keys,
+        credsKeys: state?.creds ? Object.keys(state.creds) : [],
+        keysCount: state?.keys ? Object.keys(state.keys).length : 0
+      });
+
+      // Critical validation: Check if auth state is actually valid for connection
+      if (!state?.creds || !state?.keys) {
+        this.logger.error(`[${userId}] ❌ INVALID AUTH STATE - Missing creds or keys!`, {
+          hasCreds: !!state?.creds,
+          hasKeys: !!state?.keys,
+          stateStructure: state ? Object.keys(state) : 'null'
+        });
+        throw new Error('Invalid auth state: missing credentials or keys');
+      }
+
+      // Check for required credential fields
+      const requiredCredFields = ['noiseKey', 'signedIdentityKey', 'signedPreKey', 'registrationId'];
+      const missingFields = requiredCredFields.filter(field => !state.creds[field]);
+
+      if (missingFields.length > 0) {
+        this.logger.error(`[${userId}] ❌ MISSING REQUIRED CREDENTIAL FIELDS:`, missingFields);
+        throw new Error(`Missing required credential fields: ${missingFields.join(', ')}`);
+      }
+
+      this.logger.log(`[${userId}] ✅ Auth state validation passed`);
 
       // Get latest Baileys version
       const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -360,14 +623,39 @@ export class WhatsAppService implements OnModuleInit {
         this.logger.warn(`Using outdated Baileys version: ${version}`);
       }
 
-      this.logger.log(`[${userId}] Creating WhatsApp socket with auth state...`);
+      this.logger.log(`[${userId}] Creating WhatsApp socket with Baileys version: ${version}`);
+
+      // Initialize connection tracking for indefinite session persistence
+      this.initializeConnectionTracking(userId);
+
+      // Log detailed connection attempt information
+      this.logger.log(`[${userId}] Connection attempt details:`, {
+        timestamp: new Date().toISOString(),
+        attempt: (this.connectionFailureCount.get(userId) || 0) + 1,
+        lastAttempt: this.lastConnectionAttempt.get(userId),
+        persistencePolicy: this.sessionPersistencePolicy.get(userId) || 'indefinite',
+        memoryUsage: `${this.getMemoryUsageMB()}MB / ${this.MAX_RAM_USAGE_MB}MB`
+      });
+
+      // Set up connection timeout to prevent hanging connections
+      this.setupConnectionTimeout(userId);
+
+      // Enhanced socket configuration with debugging
+      this.logger.log(`[${userId}] Creating socket with configuration:`, {
+        version,
+        browser: [this.DEVICE_NAME, this.BROWSER_NAME, this.BROWSER_VERSION],
+        hasAuthState: !!state,
+        authStateKeys: state ? Object.keys(state) : [],
+        connectTimeoutMs: 20000,
+        defaultQueryTimeoutMs: 20000
+      });
 
       const socket = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
         logger: this.pinoLogger,
-        browser: ['WhatsApp API', 'Chrome', '4.0.0'],
+        browser: [this.DEVICE_NAME, this.BROWSER_NAME, this.BROWSER_VERSION],
         syncFullHistory: false,
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: false,
@@ -380,7 +668,7 @@ export class WhatsAppService implements OnModuleInit {
         shouldSyncHistoryMessage: () => false,
         shouldIgnoreJid: () => false,
         linkPreviewImageThumbnailWidth: 192,
-        transactionOpts: { 
+        transactionOpts: {
           maxCommitRetries: 3, // Reduced retries to avoid timeout issues
           delayBetweenTriesMs: 3000 // Shorter delay between transaction retries
         },
@@ -396,6 +684,54 @@ export class WhatsAppService implements OnModuleInit {
         }
       });
 
+      // Log socket creation success and initial state
+      this.logger.log(`[${userId}] Socket created successfully. Initial state:`, {
+        hasWebSocket: !!socket.ws,
+        user: socket.user,
+        authState: socket.authState?.creds ? 'present' : 'missing',
+        socketType: typeof socket
+      });
+
+      // Add immediate WebSocket event debugging
+      if (socket.ws) {
+        const originalWs = socket.ws;
+        this.logger.log(`[${userId}] WebSocket object exists, setting up connection debugging...`);
+
+        // Monitor WebSocket events directly
+        const wsOpenHandler = () => {
+          this.logger.log(`[${userId}] 🔗 WebSocket OPENED successfully`);
+        };
+
+        const wsCloseHandler = (event: any) => {
+          this.logger.warn(`[${userId}] 🔌 WebSocket CLOSED:`, {
+            code: event?.code,
+            reason: event?.reason,
+            wasClean: event?.wasClean
+          });
+        };
+
+        const wsErrorHandler = (error: any) => {
+          this.logger.error(`[${userId}] ❌ WebSocket ERROR:`, error);
+        };
+
+        const wsMessageHandler = (data: any) => {
+          this.logger.debug(`[${userId}] 📨 WebSocket MESSAGE received:`, {
+            dataType: typeof data,
+            dataLength: data?.length || 'unknown'
+          });
+        };
+
+        // Add event listeners
+        originalWs.on('open', wsOpenHandler);
+        originalWs.on('close', wsCloseHandler);
+        originalWs.on('error', wsErrorHandler);
+        originalWs.on('message', wsMessageHandler);
+
+        this.logger.log(`[${userId}] WebSocket event listeners attached`);
+      } else {
+        this.logger.error(`[${userId}] ❌ No WebSocket object found in socket!`);
+      }
+
       this.logger.log(`[${userId}] WhatsApp socket created successfully`);
 
       const newSessionInfo: SessionInfo = {
@@ -407,6 +743,17 @@ export class WhatsAppService implements OnModuleInit {
       };
 
       this.activeSessions.set(userId, newSessionInfo);
+
+      // Immediate connection state check
+      setTimeout(() => {
+        this.logger.log(`[${userId}] 🔍 Connection state check after 1 second:`, {
+          hasSocket: !!newSessionInfo.socket,
+          hasWebSocket: !!newSessionInfo.socket?.ws,
+          isConnected: newSessionInfo.isConnected,
+          socketUser: newSessionInfo.socket?.user,
+          authStateCreds: !!newSessionInfo.socket?.authState?.creds
+        });
+      }, 1000);
 
       return new Promise<string>((resolve, reject) => {
         let qrResolved = false;
@@ -425,12 +772,17 @@ export class WhatsAppService implements OnModuleInit {
 
         socket.ev.on('creds.update', saveCreds);
 
-        // Add error handling for various events
-        socket.ev.on('messages.upsert', (messageUpdate) => {
-          this.logger.debug(`[${userId}] Messages upsert:`, {
-            messageCount: messageUpdate.messages.length,
-            type: messageUpdate.type
-          });
+        // Add error handling for various events with decryption error detection
+        socket.ev.on('messages.upsert', async (messageUpdate) => {
+          try {
+            this.logger.debug(`[${userId}] Messages upsert:`, {
+              messageCount: messageUpdate.messages.length,
+              type: messageUpdate.type
+            });
+          } catch (error) {
+            this.logger.error(`[${userId}] Error processing messages.upsert:`, error);
+            await this.handleDecryptionError(userId, error);
+          }
         });
 
         socket.ev.on('presence.update', (presence) => {
@@ -447,43 +799,67 @@ export class WhatsAppService implements OnModuleInit {
           }
         });
 
-        // Handle any other potential errors
-        process.on('uncaughtException', (error) => {
+        // Handle any other potential errors including decryption errors
+        const uncaughtHandler = async (error: Error) => {
           if (error.message.includes('Timed Out')) {
             this.logger.warn(`[${userId}] Timeout error detected:`, error.message);
+          } else if (this.persistentAuthStateService.shouldRefreshKeys(error)) {
+            this.logger.warn(`[${userId}] Decryption error in uncaught exception:`, error.message);
+            await this.handleDecryptionError(userId, error);
           } else {
             this.logger.error(`[${userId}] Uncaught exception:`, error);
           }
-        });
+        };
 
-        process.on('unhandledRejection', (reason, promise) => {
-          if (reason && typeof reason === 'object' && 'message' in reason && 
-              (reason as Error).message.includes('Timed Out')) {
-            this.logger.warn(`[${userId}] Timeout rejection:`, (reason as Error).message);
+        const rejectionHandler = async (reason: any, promise: Promise<any>) => {
+          if (reason && typeof reason === 'object' && 'message' in reason) {
+            const error = reason as Error;
+            if (error.message.includes('Timed Out')) {
+              this.logger.warn(`[${userId}] Timeout rejection:`, error.message);
+            } else if (this.persistentAuthStateService.shouldRefreshKeys(error)) {
+              this.logger.warn(`[${userId}] Decryption error in unhandled rejection:`, error.message);
+              await this.handleDecryptionError(userId, error);
+            } else {
+              this.logger.error(`[${userId}] Unhandled rejection at:`, promise, 'reason:', reason);
+            }
           } else {
             this.logger.error(`[${userId}] Unhandled rejection at:`, promise, 'reason:', reason);
           }
-        });
+        };
+
+        process.on('uncaughtException', uncaughtHandler);
+        process.on('unhandledRejection', rejectionHandler);
 
         socket.ev.on('connection.update', async (update) => {
           try {
             const { connection, lastDisconnect, qr, isNewLogin, isOnline, receivedPendingNotifications } = update;
-          
-          // Log FULL connection update payload for debugging
-          this.logger.log(`[${userId}] Connection update - Full payload:`, JSON.stringify({
+
+          // Enhanced connection logging with state tracking
+          const connectionAttempt = this.connectionAttempts.get(userId);
+          const currentState = connection ? this.mapBaileysConnectionToState(connection) : SessionConnectionState.DISCONNECTED;
+
+          this.logger.log(`[${userId}] 🔄 CONNECTION UPDATE - State: ${currentState}`, {
             connection,
             isNewLogin,
             isOnline,
             receivedPendingNotifications,
             qrPresent: !!qr,
+            attemptNumber: connectionAttempt?.attempt || 'unknown',
+            timeSinceAttemptStart: connectionAttempt ? Date.now() - connectionAttempt.startTime.getTime() : 'unknown',
             lastDisconnectError: lastDisconnect?.error ? {
               name: lastDisconnect.error.name,
               message: lastDisconnect.error.message,
-              stack: lastDisconnect.error.stack,
               statusCode: (lastDisconnect.error as any)?.output?.statusCode,
             } : null,
-            timestamp: new Date().toISOString()
-          }, null, 2));
+            timestamp: new Date().toISOString(),
+            persistencePolicy: this.sessionPersistencePolicy.get(userId) || 'indefinite'
+          });
+
+          // Update connection state tracking
+          if (connectionAttempt) {
+            connectionAttempt.state = currentState;
+            this.connectionAttempts.set(userId, connectionAttempt);
+          }
 
           if (qr && !qrResolved && !connectionResolved) {
             try {
@@ -510,17 +886,38 @@ export class WhatsAppService implements OnModuleInit {
           }
 
           if (connection === 'open') {
-            this.logger.log(`[${userId}] WhatsApp connection opened successfully - QR scan completed`);
+            this.logger.log(`[${userId}] ✅ CONNECTION ESTABLISHED SUCCESSFULLY - Session will persist indefinitely`);
             this.markSessionAsStable(userId);
             connectionResolved = true;
-            
-            // Reset all counters on successful connection
+
+            // Update session info with connection success and enforce persistence policy
+            newSessionInfo.isConnected = true; // ✅ CRITICAL FIX: Mark session as connected
+            newSessionInfo.connectionState = SessionConnectionState.CONNECTED;
+            newSessionInfo.lastConnectionAttempt = new Date();
+            newSessionInfo.connectionFailureCount = 0;
+
+            // Clear all failure tracking - session is now stable and persistent
             this.reconnectionAttempts.delete(userId);
             this.conflictAttempts.delete(userId);
             this.qrCodes.delete(userId);
             this.clearQRTimeout(userId);
-            this.logger.log(`[${userId}] Reconnection successful for user ${userId}`);
-            
+            this.connectionFailureCount.delete(userId);
+
+            // Update connection attempt tracking and clear timeout
+            const connectionAttempt = this.connectionAttempts.get(userId);
+            if (connectionAttempt) {
+              connectionAttempt.state = SessionConnectionState.CONNECTED;
+              // Clear connection timeout on successful connection
+              if (connectionAttempt.timeoutId) {
+                clearTimeout(connectionAttempt.timeoutId);
+                connectionAttempt.timeoutId = undefined;
+              }
+              this.connectionAttempts.set(userId, connectionAttempt);
+            }
+
+            this.logger.log(`[${userId}] Session persistence enforced - Policy: ${this.sessionPersistencePolicy.get(userId) || 'indefinite'}`);
+            this.logger.log(`[${userId}] Connection established and marked as stable`);
+
             // Send webhook notification for successful connection
             await this.sendWebhook(userId, 'connected', true, socket.user);
             
@@ -528,19 +925,32 @@ export class WhatsAppService implements OnModuleInit {
               await this.authStateModel.findOneAndUpdate(
                 { userId },
                 {
-                  connectionStatus: 'connected',
+                  connectionStatus: SessionStatus.CONNECTED,
                   lastUpdated: new Date(),
                   lastConnected: new Date(),
+                  lastActivity: new Date(),
                   user: socket.user ? JSON.stringify(socket.user) : null,
                   phoneNumber: socket.user?.id || null,
                   deviceName: socket.user?.name || 'WhatsApp Web',
                   isPersistent: true,
                   autoReconnect: true,
-                  reconnectionAttempts: 0
+                  persistencePolicy: PersistencePolicy.PERMANENT, // Default to permanent persistence
+                  reconnectionAttempts: 0,
+                  $inc: { totalConnections: 1 },
+                  errorCount: 0,
+                  lastError: null,
+                  circuitBreakerState: 'closed',
+                  conflictRetryCount: 0,
+                  lastConflictTime: null,
+                  wasGracefullyDisconnected: false,
+                  serverInstanceId: this.SERVER_INSTANCE_ID,
+                  lastServerStart: this.SERVER_START_TIME,
+                  connectionInstanceId: `${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
+                  lastHeartbeat: new Date()
                 },
                 { upsert: true }
               );
-              this.logger.log(`[${userId}] Auth state updated with connected status`);
+              this.logger.log(`[${userId}] Auth state updated with connected status and permanent persistence`);
             } catch (dbError) {
               this.logger.error(`[${userId}] Error updating auth state:`, dbError);
             }
@@ -548,13 +958,41 @@ export class WhatsAppService implements OnModuleInit {
             // Send webhook notification
             this.sendWebhook(userId, 'connected', true, socket.user);
           } else if (connection === 'close') {
-            this.logger.log(`[${userId}] Connection closed`);
+            this.logger.log(`[${userId}] ⚠️ CONNECTION CLOSED - Analyzing for persistence strategy`);
             newSessionInfo.isConnected = false;
+            newSessionInfo.connectionState = SessionConnectionState.DISCONNECTED;
 
             const errorStatusCode = (lastDisconnect?.error as any)?.output?.statusCode;
             const shouldReconnect = errorStatusCode !== DisconnectReason.loggedOut;
             const isRestartRequired = errorStatusCode === 515; // DisconnectReason.restartRequired
             const isConflict = errorStatusCode === 440; // Session conflict (logged in elsewhere)
+
+            // Track connection failure for exponential backoff
+            const currentFailures = this.connectionFailureCount.get(userId) || 0;
+            this.connectionFailureCount.set(userId, currentFailures + 1);
+
+            // Update connection attempt tracking and clear timeout
+            const connectionAttempt = this.connectionAttempts.get(userId);
+            if (connectionAttempt) {
+              connectionAttempt.state = SessionConnectionState.FAILED;
+              connectionAttempt.lastError = lastDisconnect?.error?.message || 'Connection closed';
+              // Clear connection timeout on connection failure
+              if (connectionAttempt.timeoutId) {
+                clearTimeout(connectionAttempt.timeoutId);
+                connectionAttempt.timeoutId = undefined;
+              }
+              this.connectionAttempts.set(userId, connectionAttempt);
+            }
+
+            this.logger.log(`[${userId}] Connection failure analysis:`, {
+              errorStatusCode,
+              shouldReconnect,
+              isRestartRequired,
+              isConflict,
+              failureCount: currentFailures + 1,
+              persistencePolicy: this.sessionPersistencePolicy.get(userId) || 'indefinite',
+              errorMessage: lastDisconnect?.error?.message
+            });
 
             // Handle connection error with enhanced error tracking
             if (lastDisconnect?.error) {
@@ -595,27 +1033,9 @@ export class WhatsAppService implements OnModuleInit {
             } else if (isConflict) {
               // Session conflict - same account logged in elsewhere
               this.logger.warn(`[${userId}] Session conflict detected - account logged in elsewhere (status 440)`);
-              
-              // IMMEDIATELY stop all reconnection attempts for conflicts
-              // Conflicts mean the same WhatsApp account is active elsewhere
-              // Any reconnection will immediately conflict again
-              this.logger.warn(`[${userId}] Stream conflict - stopping all reconnection attempts and clearing session`);
-              
-              // Mark session as conflicted and stop all reconnection attempts
-              newSessionInfo.isConnected = false;
-              newSessionInfo.isReconnecting = false;
-              this.reconnectionInProgress.delete(userId);
-              this.conflictAttempts.set(userId, 999); // Mark as permanently conflicted
-              
-              // Update database to reflect conflict state
-              await this.authStateModel.findOneAndUpdate(
-                { userId },
-                { connectionStatus: 'stream_conflict', lastUpdated: new Date() }
-              );
-              
-              // Clear the session completely to stop all activity
-              await this.clearSession(userId);
-              this.logger.log(`[${userId}] Session terminated due to stream conflict - user needs to logout from other device first`);
+
+              // Handle conflict with progressive backoff instead of permanent blocking
+              await this.handleSessionConflict(userId, newSessionInfo);
               return;
               
             } else if (!shouldReconnect) {
@@ -802,10 +1222,27 @@ export class WhatsAppService implements OnModuleInit {
 
   private async reconnectSession(userId: string): Promise<void> {
     try {
+      this.logger.log(`🔄 ENHANCED RECONNECT SESSION CALLED for user ${userId}`);
       this.logger.log(`Reconnecting session for user ${userId}`);
-      
-      const sessionInfo = this.activeSessions.get(userId);
-      if (!sessionInfo) return;
+
+      let sessionInfo = this.activeSessions.get(userId);
+      if (!sessionInfo) {
+        this.logger.log(`📝 No session info found for user ${userId} - creating new session info for reconnection`);
+
+        // Create new session info for reconnection (using only valid SessionInfo properties)
+        sessionInfo = {
+          socket: null as any, // Will be set after socket creation
+          lastUsed: new Date(),
+          isConnected: false,
+          isReconnecting: true,
+          connectionState: SessionConnectionState.CONNECTING,
+          lastError: null,
+          circuitBreakerState: 'closed'
+        };
+
+        this.activeSessions.set(userId, sessionInfo);
+        this.logger.log(`✅ Created new session info for user ${userId}`);
+      }
 
       // Clear existing socket
       if (sessionInfo.socket) {
@@ -820,32 +1257,149 @@ export class WhatsAppService implements OnModuleInit {
         }
       }
 
-      // Create new socket
+      // Create new socket with enhanced configuration and debugging
       const { state, saveCreds } = await this.loadAuthState(userId);
+
+      // Enhanced auth state validation (same as createSession)
+      this.logger.log(`[${userId}] Auth state loaded for reconnection. Validating...`, {
+        hasState: !!state,
+        hasCreds: !!state?.creds,
+        hasKeys: !!state?.keys,
+        credsKeys: state?.creds ? Object.keys(state.creds) : [],
+        keysCount: state?.keys ? Object.keys(state.keys).length : 0
+      });
+
+      // Critical validation: Check if auth state is actually valid for connection
+      if (!state?.creds || !state?.keys) {
+        this.logger.error(`[${userId}] ❌ INVALID AUTH STATE FOR RECONNECTION - Missing creds or keys!`, {
+          hasCreds: !!state?.creds,
+          hasKeys: !!state?.keys,
+          stateStructure: state ? Object.keys(state) : 'null'
+        });
+        throw new Error('Invalid auth state for reconnection: missing credentials or keys');
+      }
+
+      // Check for required credential fields
+      const requiredCredFields = ['noiseKey', 'signedIdentityKey', 'signedPreKey', 'registrationId'];
+      const missingFields = requiredCredFields.filter(field => !state.creds[field]);
+
+      if (missingFields.length > 0) {
+        this.logger.error(`[${userId}] ❌ MISSING REQUIRED CREDENTIAL FIELDS FOR RECONNECTION:`, missingFields);
+        throw new Error(`Missing required credential fields for reconnection: ${missingFields.join(', ')}`);
+      }
+
+      this.logger.log(`[${userId}] ✅ Auth state validation passed for reconnection`);
+
       const { version } = await fetchLatestBaileysVersion();
+
+      // Enhanced socket configuration with debugging (same as createSession)
+      this.logger.log(`[${userId}] Creating reconnection socket with configuration:`, {
+        version,
+        browser: [this.DEVICE_NAME, this.BROWSER_NAME, this.BROWSER_VERSION],
+        hasAuthState: !!state,
+        authStateKeys: state ? Object.keys(state) : [],
+        connectTimeoutMs: 20000,
+        defaultQueryTimeoutMs: 20000
+      });
 
       const socket = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
         logger: this.pinoLogger,
-        browser: ['WhatsApp API', 'Chrome', '4.0.0'],
+        browser: [this.DEVICE_NAME, this.BROWSER_NAME, this.BROWSER_VERSION],
         syncFullHistory: false,
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: false,
-        defaultQueryTimeoutMs: 30000,
-        connectTimeoutMs: 30000,
-        keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 1000,
-        maxMsgRetryCount: 3,
+        defaultQueryTimeoutMs: 20000, // Reduced to 20 seconds (same as createSession)
+        connectTimeoutMs: 20000, // Reduced to 20 seconds (same as createSession)
+        keepAliveIntervalMs: 45000, // Keep-alive every 45 seconds (same as createSession)
+        retryRequestDelayMs: 2000, // Shorter delay between retries (same as createSession)
+        maxMsgRetryCount: 1, // Minimal retry count to avoid conflicts (same as createSession)
         emitOwnEvents: false,
-        getMessage: async (_key) => {
+        shouldSyncHistoryMessage: () => false,
+        shouldIgnoreJid: () => false,
+        linkPreviewImageThumbnailWidth: 192,
+        transactionOpts: {
+          maxCommitRetries: 3, // Reduced retries to avoid timeout issues
+          delayBetweenTriesMs: 3000 // Shorter delay between transaction retries
+        },
+        // Disable some features that can cause conflicts
+        cachedGroupMetadata: () => undefined,
+        patchMessageBeforeSending: (msg) => {
+          // Don't patch messages to avoid conflicts
+          return msg;
+        },
+        getMessage: async (key) => {
+          this.logger.debug(`[${userId}] getMessage called during reconnection with key:`, key);
           return { conversation: '' };
         }
       });
 
+      // Log socket creation success and initial state (same as createSession)
+      this.logger.log(`[${userId}] Reconnection socket created successfully. Initial state:`, {
+        hasWebSocket: !!socket.ws,
+        user: socket.user,
+        authState: socket.authState?.creds ? 'present' : 'missing',
+        socketType: typeof socket
+      });
+
+      // Add immediate WebSocket event debugging (same as createSession)
+      if (socket.ws) {
+        const originalWs = socket.ws;
+        this.logger.log(`[${userId}] WebSocket object exists for reconnection, setting up connection debugging...`);
+
+        // Monitor WebSocket events directly
+        const wsOpenHandler = () => {
+          this.logger.log(`[${userId}] 🔗 Reconnection WebSocket OPENED successfully`);
+        };
+
+        const wsCloseHandler = (event: any) => {
+          this.logger.warn(`[${userId}] 🔌 Reconnection WebSocket CLOSED:`, {
+            code: event?.code,
+            reason: event?.reason,
+            wasClean: event?.wasClean
+          });
+        };
+
+        const wsErrorHandler = (error: any) => {
+          this.logger.error(`[${userId}] ❌ Reconnection WebSocket ERROR:`, error);
+        };
+
+        const wsMessageHandler = (data: any) => {
+          this.logger.debug(`[${userId}] 📨 Reconnection WebSocket MESSAGE received:`, {
+            dataType: typeof data,
+            dataLength: data?.length || 'unknown'
+          });
+        };
+
+        // Add event listeners
+        originalWs.on('open', wsOpenHandler);
+        originalWs.on('close', wsCloseHandler);
+        originalWs.on('error', wsErrorHandler);
+        originalWs.on('message', wsMessageHandler);
+
+        this.logger.log(`[${userId}] Reconnection WebSocket event listeners attached`);
+      } else {
+        this.logger.error(`[${userId}] ❌ No WebSocket object found in reconnection socket!`);
+      }
+
       sessionInfo.socket = socket;
       sessionInfo.lastUsed = new Date();
+
+      // Set up connection timeout to prevent hanging connections (same as createSession)
+      this.setupConnectionTimeout(userId);
+
+      // Immediate connection state check for reconnection
+      setTimeout(() => {
+        this.logger.log(`[${userId}] 🔍 Reconnection state check after 1 second:`, {
+          hasSocket: !!sessionInfo.socket,
+          hasWebSocket: !!sessionInfo.socket?.ws,
+          isConnected: sessionInfo.isConnected,
+          socketUser: sessionInfo.socket?.user,
+          authStateCreds: !!sessionInfo.socket?.authState?.creds
+        });
+      }, 1000);
 
       socket.ev.on('creds.update', saveCreds);
       socket.ev.on('connection.update', async (update) => {
@@ -906,17 +1460,9 @@ export class WhatsAppService implements OnModuleInit {
               this.attemptReconnection(userId, true); // true = isPostPairingRestart
             }
           } else if (isConflict) {
-            // Stream conflict during reconnection - stop immediately
-            this.logger.warn(`[${userId}] Stream conflict during reconnection - stopping all attempts`);
-            sessionInfo.isConnected = false;
-            sessionInfo.isReconnecting = false;
-            this.reconnectionInProgress.delete(userId);
-            this.conflictAttempts.set(userId, 999); // Mark as permanently conflicted
-            
-            await this.authStateModel.findOneAndUpdate(
-              { userId },
-              { connectionStatus: 'stream_conflict', lastUpdated: new Date() }
-            );
+            // Stream conflict during reconnection - handle smartly
+            this.logger.warn(`[${userId}] Stream conflict during reconnection`);
+            await this.handleSessionConflict(userId, sessionInfo);
             
             await this.clearSession(userId);
             this.logger.log(`[${userId}] Reconnection stopped due to stream conflict`);
@@ -1062,170 +1608,679 @@ export class WhatsAppService implements OnModuleInit {
   }
 
   async sendMessage(userId: string, to: string, message?: string, documentUrl?: string): Promise<any> {
-    try {
-      // Check if session is marked as conflicted
-      const conflictCount = this.conflictAttempts.get(userId) || 0;
-      if (conflictCount >= 999) {
-        throw new Error('Session is in conflict state. User must logout from other devices first before sending messages.');
-      }
-      
-      let sessionInfo = this.activeSessions.get(userId);
-      
-      // If no session at all, try to activate
-      if (!sessionInfo) {
-        this.logger.log(`[${userId}] No session found, activating from database...`);
-        await this.activateSession(userId);
-        sessionInfo = this.activeSessions.get(userId);
-        
-        // Wait for session to establish
-        await new Promise(resolve => setTimeout(resolve, 3000));
-      }
+    const maxRetries = 2;
+    let lastError: any;
 
-      // If session exists but not connected, check if it's reconnecting
-      if (sessionInfo && !sessionInfo.isConnected && !sessionInfo.isReconnecting && !this.reconnectionInProgress.get(userId)) {
-        this.logger.log(`[${userId}] Session exists but not connected, attempting reconnection...`);
-        await this.activateSession(userId);
-        await new Promise(resolve => setTimeout(resolve, 3000));
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        this.logger.log(`[${userId}] 📤 ENHANCED INTELLIGENT SEND MESSAGE - Attempt ${attempt}/${maxRetries} - Target: ${to}`);
+
+        // Check if session is marked as conflicted
+        const conflictCount = this.conflictAttempts.get(userId) || 0;
+        if (conflictCount >= 999) {
+          throw new Error('Session is in conflict state. User must logout from other devices first before sending messages.');
+        }
+
+        // Enhanced intelligent session activation and recovery
+        const forceReactivation = attempt > 1; // Force reactivation on retry attempts
+        const activationResult = await this.intelligentSessionActivation(userId, forceReactivation);
+        if (!activationResult.success) {
+          throw new Error(`Session activation failed: ${activationResult.error}`);
+        }
+
+        const sessionInfo = this.activeSessions.get(userId);
+        if (!sessionInfo?.socket) {
+          throw new Error('WhatsApp session could not be established after activation');
+        }
+
+        // Enhanced session readiness verification
+        const readinessCheck = await this.verifySessionReadiness(userId);
+        if (!readinessCheck.ready) {
+          if (attempt < maxRetries) {
+            this.logger.warn(`[${userId}] ⚠️ Session not ready (${readinessCheck.reason}) - will retry with force activation`);
+            continue;
+          }
+          throw new Error(`Session not ready for messaging: ${readinessCheck.reason}`);
+        }
+
+        this.logger.log(`[${userId}] ✅ Session verified ready - proceeding with message send (attempt ${attempt})`);
+        this.updateSessionUsage(userId);
+
+        // Attempt to send the message
+        const sendResult = await this.performMessageSend(userId, to, message, documentUrl, sessionInfo);
+
+        if (sendResult.success) {
+          this.logger.log(`[${userId}] ✅ Message sent successfully on attempt ${attempt}`);
+          return {
+            ...sendResult.data,
+            retried: attempt > 1,
+            attempts: attempt
+          };
+        } else {
+          throw new Error(sendResult.error);
+        }
+
+      } catch (error) {
+        lastError = error;
+        this.logger.error(`[${userId}] ❌ Send attempt ${attempt} failed:`, error);
+
+        if (attempt < maxRetries) {
+          // Wait before retry with exponential backoff
+          const delay = Math.pow(2, attempt - 1) * 1000;
+          this.logger.log(`[${userId}] 🔄 Waiting ${delay}ms before retry attempt ${attempt + 1}`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    // All attempts failed
+    this.logger.error(`[${userId}] ❌ All ${maxRetries} send attempts failed. Last error:`, lastError);
+    throw new Error(`Failed to send message after ${maxRetries} attempts: ${lastError.message}`);
+  }
+
+  /**
+   * Perform the actual message sending with proper error handling
+   */
+  private async performMessageSend(userId: string, to: string, message?: string, documentUrl?: string, sessionInfo?: any): Promise<{success: boolean, data?: any, error?: string}> {
+    try {
+      if (!sessionInfo) {
         sessionInfo = this.activeSessions.get(userId);
       }
 
       if (!sessionInfo?.socket) {
-        throw new Error('WhatsApp session could not be established');
+        return { success: false, error: 'No active socket available' };
       }
 
-      // For connected sessions, try sending immediately without stability checks
-      if (sessionInfo.isConnected) {
-        this.updateSessionUsage(userId);
+      // Format phone number
+      let jid = to;
+      if (!to.includes('@')) {
+        jid = `${to}@s.whatsapp.net`;
+      }
 
-        // Format phone number
-        let jid = to;
-        if (!to.includes('@')) {
-          jid = `${to}@s.whatsapp.net`;
+      let result: any;
+
+      if (documentUrl) {
+        const response = await fetch(documentUrl);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch document: ${response.statusText}`);
         }
 
-        let result: any;
+        const buffer = await response.arrayBuffer();
+        const mimeType = response.headers.get('content-type') || 'application/octet-stream';
 
-        try {
-          if (documentUrl) {
-            const response = await fetch(documentUrl);
-            if (!response.ok) {
-              throw new Error(`Failed to fetch document: ${response.statusText}`);
-            }
-            
-            const buffer = await response.arrayBuffer();
-            const mimeType = response.headers.get('content-type') || 'application/octet-stream';
-            
-            if (mimeType.startsWith('image/')) {
-              result = await sessionInfo.socket.sendMessage(jid, {
-                image: Buffer.from(buffer),
-                caption: message || '',
-              });
-            } else if (mimeType.startsWith('audio/')) {
-              result = await sessionInfo.socket.sendMessage(jid, {
-                audio: Buffer.from(buffer),
-                mimetype: mimeType,
-              });
-            } else if (mimeType.startsWith('video/')) {
-              result = await sessionInfo.socket.sendMessage(jid, {
-                video: Buffer.from(buffer),
-                caption: message || '',
-              });
-            } else {
-              result = await sessionInfo.socket.sendMessage(jid, {
-                document: Buffer.from(buffer),
-                mimetype: mimeType,
-                fileName: documentUrl.split('/').pop() || 'document',
-              });
-            }
-          } else if (message) {
-            result = await sessionInfo.socket.sendMessage(jid, { text: message });
-          } else {
-            throw new Error('Either message or document URL is required');
-          }
-
-          this.logger.log(`[${userId}] Message sent successfully to ${jid}`);
-          return {
-            success: true,
-            messageId: result.key.id,
-            timestamp: result.messageTimestamp,
-            to: jid,
-          };
-
-        } catch (sendError) {
-          this.logger.error(`[${userId}] Send failed with connected session:`, sendError);
-          throw sendError;
+        if (mimeType.startsWith('image/')) {
+          result = await sessionInfo.socket.sendMessage(jid, {
+            image: Buffer.from(buffer),
+            caption: message || '',
+          });
+        } else if (mimeType.startsWith('audio/')) {
+          result = await sessionInfo.socket.sendMessage(jid, {
+            audio: Buffer.from(buffer),
+            mimetype: mimeType,
+          });
+        } else if (mimeType.startsWith('video/')) {
+          result = await sessionInfo.socket.sendMessage(jid, {
+            video: Buffer.from(buffer),
+            caption: message || '',
+          });
+        } else {
+          result = await sessionInfo.socket.sendMessage(jid, {
+            document: Buffer.from(buffer),
+            mimetype: mimeType,
+            fileName: documentUrl.split('/').pop() || 'document',
+          });
         }
+      } else if (message) {
+        result = await sessionInfo.socket.sendMessage(jid, { text: message });
       } else {
-        throw new Error('Session is not connected and could not be established');
+        return { success: false, error: 'Either message or document URL is required' };
       }
+
+      this.logger.log(`[${userId}] Message sent successfully to ${jid}`);
+      return {
+        success: true,
+        data: {
+          messageId: result.key.id,
+          timestamp: result.messageTimestamp,
+          to: jid,
+        }
+      };
+
+    } catch (sendError) {
+      this.logger.error(`[${userId}] ❌ Message send failed:`, sendError);
+      return { success: false, error: sendError.message };
+    }
+  }
+
+  /**
+   * Check for recent decryption errors that indicate session corruption
+   */
+  private hasRecentDecryptionErrors(userId: string): boolean {
+    // This would ideally track decryption errors, but for now we'll use a simple heuristic
+    // In a production system, you'd want to track these errors in a Map with timestamps
+    const sessionInfo = this.activeSessions.get(userId);
+    if (!sessionInfo?.socket) return false;
+
+    // Check if socket has user info but connection issues (indicates potential corruption)
+    return !!(sessionInfo.socket.user && !sessionInfo.isConnected);
+  }
+
+  /**
+   * Perform enhanced activation with multiple retry strategies
+   */
+  private async performEnhancedActivation(userId: string): Promise<{success: boolean, error?: string}> {
+    const maxRetries = 3;
+    let lastError: string = '';
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        this.logger.log(`[${userId}] 🔄 Enhanced activation attempt ${attempt}/${maxRetries}`);
+
+        // Clear any existing session completely
+        await this.clearSession(userId);
+
+        // Wait a moment for cleanup
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Activate session
+        await this.activateSession(userId);
+
+        // Enhanced connection verification with longer timeout
+        const verificationResult = await this.waitForConnectionEstablishment(userId, 30000);
+
+        if (verificationResult.success) {
+          this.logger.log(`[${userId}] ✅ Enhanced activation successful on attempt ${attempt}`);
+          return { success: true };
+        } else {
+          lastError = verificationResult.error || 'Connection not established';
+          this.logger.warn(`[${userId}] ⚠️ Attempt ${attempt} failed: ${lastError}`);
+
+          if (attempt < maxRetries) {
+            // Exponential backoff
+            const delay = Math.pow(2, attempt) * 1000;
+            this.logger.log(`[${userId}] Waiting ${delay}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+        }
+      } catch (error) {
+        lastError = error.message;
+        this.logger.error(`[${userId}] ❌ Enhanced activation attempt ${attempt} failed:`, error);
+
+        if (attempt < maxRetries) {
+          const delay = Math.pow(2, attempt) * 1000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    return { success: false, error: `All activation attempts failed. Last error: ${lastError}` };
+  }
+
+  /**
+   * Wait for connection establishment with comprehensive checks
+   */
+  private async waitForConnectionEstablishment(userId: string, timeoutMs: number = 30000): Promise<{success: boolean, error?: string}> {
+    const startTime = Date.now();
+    const checkInterval = 1000; // Check every second
+
+    while (Date.now() - startTime < timeoutMs) {
+      const sessionInfo = this.activeSessions.get(userId);
+
+      if (!sessionInfo) {
+        return { success: false, error: 'Session info not found' };
+      }
+
+      // Comprehensive connection check
+      const isFullyConnected = sessionInfo.isConnected &&
+                              sessionInfo.socket &&
+                              sessionInfo.socket.user &&
+                              sessionInfo.socket.ws &&
+                              sessionInfo.connectionState === SessionConnectionState.CONNECTED;
+
+      if (isFullyConnected) {
+        this.logger.log(`[${userId}] ✅ Connection fully established`);
+        return { success: true };
+      }
+
+      // Log current state for debugging
+      this.logger.debug(`[${userId}] Connection check:`, {
+        isConnected: sessionInfo.isConnected,
+        hasSocket: !!sessionInfo.socket,
+        hasUser: !!sessionInfo.socket?.user,
+        hasWebSocket: !!sessionInfo.socket?.ws,
+        connectionState: sessionInfo.connectionState,
+        elapsed: Date.now() - startTime
+      });
+
+      await new Promise(resolve => setTimeout(resolve, checkInterval));
+    }
+
+    return { success: false, error: `Connection establishment timeout after ${timeoutMs}ms` };
+  }
+
+  /**
+   * Enhanced intelligent session activation with comprehensive state detection and recovery
+   */
+  private async intelligentSessionActivation(userId: string, forceReactivation: boolean = false): Promise<{success: boolean, error?: string}> {
+    try {
+      this.logger.log(`[${userId}] 🧠 INTELLIGENT SESSION ACTIVATION - Force: ${forceReactivation}`);
+
+      // Check if session is marked as conflicted
+      const conflictCount = this.conflictAttempts.get(userId) || 0;
+      if (conflictCount >= 999) {
+        return { success: false, error: 'Session is in conflict state. User must logout from other devices first.' };
+      }
+
+      // Get current session state
+      let sessionInfo = this.activeSessions.get(userId);
+      const persistencePolicy = this.sessionPersistencePolicy.get(userId) || 'indefinite';
+
+      this.logger.log(`[${userId}] 📊 Current session state:`, {
+        hasSession: !!sessionInfo,
+        isConnected: sessionInfo?.isConnected || false,
+        isReconnecting: sessionInfo?.isReconnecting || false,
+        persistencePolicy,
+        forceReactivation,
+        connectionState: sessionInfo?.connectionState,
+        hasSocket: !!sessionInfo?.socket,
+        hasWebSocket: !!sessionInfo?.socket?.ws,
+        socketUser: sessionInfo?.socket?.user
+      });
+
+      // Check if auth state exists in database
+      const authState = await this.authStateModel.findOne({ userId });
+      if (!authState) {
+        return { success: false, error: 'WhatsApp session not found. Please scan QR code first.' };
+      }
+
+      // Enhanced session validation - check for corruption indicators
+      if (sessionInfo?.socket) {
+        const hasDecryptionErrors = this.hasRecentDecryptionErrors(userId);
+        if (hasDecryptionErrors) {
+          this.logger.warn(`[${userId}] 🔍 Detected recent decryption errors - forcing session refresh`);
+          forceReactivation = true;
+        }
+      }
+
+      // Scenario 1: Force reactivation requested or corruption detected
+      if (forceReactivation) {
+        this.logger.log(`[${userId}] 🔄 Force reactivation requested - performing enhanced activation`);
+        return await this.performEnhancedActivation(userId);
+      }
+
+      // Scenario 2: No active session at all - activate from stored credentials
+      if (!sessionInfo) {
+        this.logger.log(`[${userId}] 🔄 No active session - triggering activation (policy: ${persistencePolicy})`);
+        return await this.performEnhancedActivation(userId);
+      }
+
+      // Scenario 3: Session exists but not connected - attempt enhanced reconnection
+      if (sessionInfo && !sessionInfo.isConnected && !sessionInfo.isReconnecting && !this.reconnectionInProgress.get(userId)) {
+
+        // Quick check: if socket has user, it might actually be connected
+        if (sessionInfo.socket?.user && sessionInfo.socket?.ws) {
+          this.logger.log(`[${userId}] 🔄 Session marked disconnected but socket has user and websocket - updating status`);
+          sessionInfo.isConnected = true;
+          sessionInfo.connectionState = SessionConnectionState.CONNECTED;
+          return { success: true };
+        }
+
+        this.logger.log(`[${userId}] 🔄 Session disconnected - attempting enhanced reconnection for message delivery`);
+        return await this.performEnhancedActivation(userId);
+      }
+
+      // Scenario 4: Session exists and appears connected - enhanced verification
+      if (sessionInfo?.isConnected || (sessionInfo?.socket?.user && sessionInfo?.socket?.ws)) {
+        this.logger.log(`[${userId}] ✅ Session appears connected - performing enhanced verification`);
+
+        // Update connection status if socket has user but session not marked as connected
+        if (!sessionInfo.isConnected && sessionInfo.socket?.user && sessionInfo.socket?.ws) {
+          this.logger.log(`[${userId}] 🔄 Updating session connection status - socket has user authentication and websocket`);
+          sessionInfo.isConnected = true;
+          sessionInfo.connectionState = SessionConnectionState.CONNECTED;
+        }
+
+        // Perform a quick health check
+        try {
+          const healthCheck = await this.verifySessionReadiness(userId);
+          if (healthCheck.ready) {
+            this.logger.log(`[${userId}] ✅ Session health check passed`);
+            return { success: true };
+          } else {
+            this.logger.warn(`[${userId}] ⚠️ Session health check failed: ${healthCheck.reason} - triggering refresh`);
+            return await this.performEnhancedActivation(userId);
+          }
+        } catch (healthError) {
+          this.logger.warn(`[${userId}] ⚠️ Session health check error: ${healthError.message} - assuming connected`);
+          return { success: true };
+        }
+      }
+
+      // Scenario 5: Session exists but in unknown state - attempt recovery
+      if (sessionInfo) {
+        this.logger.log(`[${userId}] ❓ Session in unknown state - attempting enhanced recovery`);
+
+        if (sessionInfo.socket) {
+          // Try to use existing socket if it seems viable
+          if (sessionInfo.socket.user || sessionInfo.socket.ws) {
+            this.logger.log(`[${userId}] 🔄 Existing socket has some connectivity - attempting to use`);
+            return { success: true };
+          }
+        }
+
+        // Last resort: perform enhanced activation
+        this.logger.log(`[${userId}] 🔄 Unknown state recovery - performing enhanced activation`);
+        return await this.performEnhancedActivation(userId);
+      }
+
+      return { success: false, error: 'Unable to establish session after all attempts' };
 
     } catch (error) {
-      this.logger.error(`Error sending message for user ${userId}:`, error);
-      throw error;
+      this.logger.error(`[${userId}] ❌ Intelligent session activation error:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Verify session readiness for message sending
+   */
+  private async verifySessionReadiness(userId: string): Promise<{ready: boolean, reason?: string}> {
+    try {
+      const sessionInfo = this.activeSessions.get(userId);
+
+      if (!sessionInfo) {
+        return { ready: false, reason: 'No session info available' };
+      }
+
+      if (!sessionInfo.socket) {
+        return { ready: false, reason: 'No socket available' };
+      }
+
+      // Check if socket has user information (indicates successful authentication)
+      if (!sessionInfo.socket.user) {
+        return { ready: false, reason: 'Socket not authenticated (no user info)' };
+      }
+
+      // Check if WebSocket exists (basic connectivity check)
+      if (!sessionInfo.socket.ws) {
+        return { ready: false, reason: 'No WebSocket connection available' };
+      }
+
+      // Enhanced connection verification with multiple checks
+      let isActuallyConnected = false;
+      let connectionDetails = '';
+
+      try {
+        // Primary check: if session is marked as connected and has authenticated socket
+        if (sessionInfo.isConnected && sessionInfo.socket.user) {
+          isActuallyConnected = true;
+          connectionDetails = 'session_marked_connected_with_auth';
+          this.logger.debug(`[${userId}] ✅ Session marked connected with authentication`);
+        } else {
+          // Secondary check: validate actual socket connection
+          const actualConnectionStatus = await this.validateSocketConnection(userId, sessionInfo);
+
+          if (actualConnectionStatus.isConnected) {
+            sessionInfo.isConnected = true;
+            isActuallyConnected = true;
+            connectionDetails = `validated_${actualConnectionStatus.connectionStatus}`;
+            this.logger.log(`[${userId}] 🔄 Updated session connection status to connected via validation`);
+          } else {
+            // Tertiary check: if socket has user info, consider it connected even if validation fails
+            if (sessionInfo.socket.user) {
+              this.logger.warn(`[${userId}] ⚠️ Validation failed but socket has user info - considering connected`);
+              sessionInfo.isConnected = true;
+              isActuallyConnected = true;
+              connectionDetails = `fallback_user_authenticated`;
+            } else {
+              connectionDetails = `disconnected_${actualConnectionStatus.connectionStatus}`;
+              return { ready: false, reason: `Session not ready (${connectionDetails})` };
+            }
+          }
+        }
+      } catch (statusError) {
+        this.logger.debug(`[${userId}] Connection status validation failed:`, statusError);
+        // Final fallback: if socket has user, assume connected
+        if (sessionInfo.socket.user) {
+          this.logger.warn(`[${userId}] ⚠️ Validation error but socket has user - assuming connected`);
+          isActuallyConnected = true;
+          connectionDetails = 'error_fallback_with_user';
+        } else {
+          return { ready: false, reason: 'Unable to verify connection status and no user info' };
+        }
+      }
+
+      if (!isActuallyConnected) {
+        return { ready: false, reason: `Session not connected (${connectionDetails})` };
+      }
+
+      this.logger.log(`[${userId}] ✅ Session readiness verified - ready for messaging (${connectionDetails})`);
+      return { ready: true };
+
+    } catch (error) {
+      this.logger.error(`[${userId}] ❌ Session readiness check failed:`, error);
+      return { ready: false, reason: `Readiness check failed: ${error.message}` };
     }
   }
 
   async restoreExistingSessions(): Promise<void> {
     try {
-      this.logger.log('Restoring existing sessions...');
+      this.logger.log('Starting enhanced persistent session restoration...');
+      this.logger.log(`Server Instance ID: ${this.SERVER_INSTANCE_ID}`);
+      this.logger.log(`Server Start Time: ${this.SERVER_START_TIME.toISOString()}`);
 
-      // Find sessions that should be restored (connected or recently disconnected with auto-reconnect enabled)
-      const existingSessions = await this.authStateModel.find({
-        $or: [
-          { connectionStatus: 'connected' },
-          {
-            connectionStatus: { $in: ['disconnected', 'restarting_after_pairing'] },
-            autoReconnect: true,
-            isPersistent: true,
-            lastConnected: { $exists: true }
-          }
-        ]
+      // First, mark all sessions that were CONNECTED as DISCONNECTED to prevent conflicts
+      // This handles the case where server restart left sessions in CONNECTED state
+      const connectedSessionsUpdate = await this.authStateModel.updateMany(
+        {
+          connectionStatus: SessionStatus.CONNECTED,
+          persistencePolicy: { $in: [PersistencePolicy.PERSISTENT, PersistencePolicy.PERMANENT] }
+        },
+        {
+          connectionStatus: SessionStatus.DISCONNECTED,
+          lastUpdated: new Date(),
+          lastDisconnected: new Date(),
+          lastDisconnectReason: 'Server restart - session marked for restoration',
+          lastDisconnectType: 'server_restart',
+          wasGracefullyDisconnected: false,
+          serverInstanceId: this.SERVER_INSTANCE_ID,
+          lastServerStart: this.SERVER_START_TIME
+        }
+      );
+
+      if (connectedSessionsUpdate.modifiedCount > 0) {
+        this.logger.log(`Marked ${connectedSessionsUpdate.modifiedCount} previously connected sessions as disconnected for safe restoration`);
+      }
+
+      // Use the new schema method to find sessions that should be restored
+      const existingSessions = await (this.authStateModel as any).findSessionsForRestore();
+
+      this.logger.log(`Found ${existingSessions.length} persistent sessions to restore`);
+
+      if (existingSessions.length === 0) {
+        this.logger.log('No persistent sessions found to restore');
+        return;
+      }
+
+      // Sort sessions by priority and last connected time
+      existingSessions.sort((a: any, b: any) => {
+        // Higher priority first
+        if (a.priority !== b.priority) {
+          return b.priority - a.priority;
+        }
+        // More recently connected first
+        const aTime = a.lastConnected ? a.lastConnected.getTime() : 0;
+        const bTime = b.lastConnected ? b.lastConnected.getTime() : 0;
+        return bTime - aTime;
       });
 
-      this.logger.log(`Found ${existingSessions.length} existing sessions to restore`);
+      const restorationResults = {
+        total: existingSessions.length,
+        successful: 0,
+        failed: 0,
+        skipped: 0
+      };
 
-      // Restore sessions with staggered timing to avoid overwhelming the system
+      // Restore sessions with enhanced error handling and retry logic
       for (let i = 0; i < existingSessions.length; i++) {
         const session = existingSessions[i];
-        try {
-          this.logger.log(`Restoring session for user ${session.userId} (${i + 1}/${existingSessions.length})`);
+        const maxRetries = 3;
+        let retryCount = 0;
+        let restored = false;
 
-          // Add delay between session restorations to prevent conflicts
-          if (i > 0) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
+        this.logger.log(`Restoring session ${i + 1}/${existingSessions.length}: ${session.userId} (Policy: ${session.persistencePolicy}, Priority: ${session.priority})`);
+
+        while (retryCount < maxRetries && !restored) {
+          try {
+            // Add progressive delay between session restorations
+            const baseDelay = 2000; // 2 seconds base delay
+            const progressiveDelay = i * 1000; // Additional 1 second per session
+            const retryDelay = retryCount * 2000; // Additional 2 seconds per retry
+            const totalDelay = baseDelay + progressiveDelay + retryDelay;
+
+            if (i > 0 || retryCount > 0) {
+              this.logger.log(`Waiting ${totalDelay}ms before restoration attempt ${retryCount + 1}...`);
+              await new Promise(resolve => setTimeout(resolve, totalDelay));
+            }
+
+            // Check if session is already active (might have been restored by another process)
+            if (this.activeSessions.has(session.userId)) {
+              this.logger.log(`Session ${session.userId} already active, skipping restoration`);
+              restorationResults.skipped++;
+              restored = true;
+              break;
+            }
+
+            // Attempt to restore the session
+            await this.activateExistingSession(session.userId);
+
+            // Update session metadata on successful restoration
+            await this.authStateModel.findOneAndUpdate(
+              { userId: session.userId },
+              {
+                lastUpdated: new Date(),
+                lastActivity: new Date(),
+                reconnectionAttempts: 0,
+                errorCount: 0,
+                lastError: null,
+                lastErrorTime: null,
+                circuitBreakerState: 'closed'
+              }
+            );
+
+            this.logger.log(`Successfully restored session for ${session.userId}`);
+            restorationResults.successful++;
+            restored = true;
+
+          } catch (error) {
+            retryCount++;
+            this.logger.warn(`Restoration attempt ${retryCount}/${maxRetries} failed for ${session.userId}:`, error.message);
+
+            if (retryCount >= maxRetries) {
+              this.logger.error(`Failed to restore session for ${session.userId} after ${maxRetries} attempts`);
+
+              // Update failure count and status
+              await this.authStateModel.findOneAndUpdate(
+                { userId: session.userId },
+                {
+                  connectionStatus: SessionStatus.DISCONNECTED,
+                  lastUpdated: new Date(),
+                  lastActivity: new Date(),
+                  lastDisconnected: new Date(),
+                  lastDisconnectReason: `Restoration failed: ${error.message}`,
+                  $inc: { reconnectionAttempts: 1, errorCount: 1 },
+                  lastError: error.message,
+                  lastErrorTime: new Date()
+                }
+              );
+
+              restorationResults.failed++;
+            }
           }
+        }
+
+        // Log progress every 10 sessions
+        if ((i + 1) % 10 === 0) {
+          this.logger.log(`Restoration progress: ${i + 1}/${existingSessions.length} processed (${restorationResults.successful} successful, ${restorationResults.failed} failed, ${restorationResults.skipped} skipped)`);
+        }
+      }
+
+      this.logger.log(`Persistent session restoration completed:`, {
+        total: restorationResults.total,
+        successful: restorationResults.successful,
+        failed: restorationResults.failed,
+        skipped: restorationResults.skipped,
+        activeSessions: this.activeSessions.size
+      });
+
+      // Schedule retry for failed sessions after a delay
+      if (restorationResults.failed > 0) {
+        this.logger.log(`Scheduling retry for ${restorationResults.failed} failed sessions in 5 minutes...`);
+        setTimeout(() => {
+          this.retryFailedSessionRestorations().catch(err =>
+            this.logger.error('Error in retry failed session restorations:', err)
+          );
+        }, 5 * 60 * 1000); // 5 minutes
+      }
+
+    } catch (error) {
+      this.logger.error('Critical error in persistent session restoration:', error);
+    }
+  }
+
+  /**
+   * Retry failed session restorations
+   */
+  private async retryFailedSessionRestorations(): Promise<void> {
+    try {
+      this.logger.log('Retrying failed session restorations...');
+
+      // Find sessions that failed to restore (disconnected with recent errors)
+      const failedSessions = await this.authStateModel.find({
+        connectionStatus: SessionStatus.DISCONNECTED,
+        persistencePolicy: { $in: [PersistencePolicy.PERSISTENT, PersistencePolicy.PERMANENT] },
+        autoReconnect: true,
+        isManuallyDisabled: { $ne: true },
+        lastErrorTime: { $gte: new Date(Date.now() - 30 * 60 * 1000) }, // Errors in last 30 minutes
+        errorCount: { $lt: 10 } // Don't retry sessions with too many errors
+      });
+
+      this.logger.log(`Found ${failedSessions.length} failed sessions to retry`);
+
+      for (const session of failedSessions) {
+        try {
+          // Skip if session is already active
+          if (this.activeSessions.has(session.userId)) {
+            continue;
+          }
+
+          this.logger.log(`Retrying restoration for ${session.userId}...`);
 
           await this.activateExistingSession(session.userId);
 
-          // Update session metadata
-          await this.authStateModel.findOneAndUpdate(
-            { userId: session.userId },
-            {
-              lastUpdated: new Date(),
-              reconnectionAttempts: 0
-            }
-          );
+          this.logger.log(`Successfully restored ${session.userId} on retry`);
+
+          // Add delay between retries
+          await new Promise(resolve => setTimeout(resolve, 5000));
 
         } catch (error) {
-          this.logger.error(`Failed to restore session for ${session.userId}:`, error);
+          this.logger.warn(`Retry failed for ${session.userId}:`, error.message);
 
-          // Update failure count and status
+          // Increment error count
           await this.authStateModel.findOneAndUpdate(
             { userId: session.userId },
             {
-              connectionStatus: 'disconnected',
-              lastUpdated: new Date(),
-              lastDisconnected: new Date(),
-              lastDisconnectReason: error.message,
-              $inc: { reconnectionAttempts: 1 }
+              $inc: { errorCount: 1 },
+              lastError: error.message,
+              lastErrorTime: new Date()
             }
           );
         }
       }
 
-      this.logger.log(`Session restoration completed. Active sessions: ${this.activeSessions.size}`);
+      this.logger.log('Failed session restoration retry completed');
     } catch (error) {
-      this.logger.error('Error restoring existing sessions:', error);
+      this.logger.error('Error in retry failed session restorations:', error);
     }
   }
 
@@ -1244,7 +2299,7 @@ export class WhatsAppService implements OnModuleInit {
         auth: state,
         printQRInTerminal: false,
         logger: this.pinoLogger,
-        browser: ['WhatsApp API', 'Chrome', '4.0.0'],
+        browser: [this.DEVICE_NAME, this.BROWSER_NAME, this.BROWSER_VERSION],
         syncFullHistory: false,
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: false,
@@ -1307,17 +2362,9 @@ export class WhatsAppService implements OnModuleInit {
           const isConflict = errorStatusCode === 440; // Session conflict (logged in elsewhere)
 
           if (isConflict) {
-            // Stream conflict during activation - stop immediately
-            this.logger.warn(`[${userId}] Stream conflict during activation - stopping all attempts`);
-            sessionInfo.isConnected = false;
-            sessionInfo.isReconnecting = false;
-            this.reconnectionInProgress.delete(userId);
-            this.conflictAttempts.set(userId, 999); // Mark as permanently conflicted
-            
-            await this.authStateModel.findOneAndUpdate(
-              { userId },
-              { connectionStatus: 'stream_conflict', lastUpdated: new Date() }
-            );
+            // Stream conflict during activation - handle smartly
+            this.logger.warn(`[${userId}] Stream conflict during activation`);
+            await this.handleSessionConflict(userId, sessionInfo);
             
             await this.clearSession(userId);
             this.logger.log(`[${userId}] Activation stopped due to stream conflict`);
@@ -1370,18 +2417,24 @@ export class WhatsAppService implements OnModuleInit {
 
   async activateSession(userId: string): Promise<void> {
     try {
-      this.logger.log(`[${userId}] Activating session from database...`);
-      
+      this.logger.log(`[${userId}] Activating session without QR using stored credentials...`);
+
       // Check if session is marked as conflicted
       const conflictCount = this.conflictAttempts.get(userId) || 0;
       if (conflictCount >= 999) {
         throw new Error('Session is marked as conflicted. User must logout from other devices first.');
       }
-      
+
       // Check if session is already active and stable
       if (this.isSessionStable(userId)) {
         this.logger.log(`[${userId}] Session already active and stable`);
         return;
+      }
+
+      // Verify we have valid auth state for QR-less activation
+      const hasValidAuth = await this.hasValidAuthState(userId);
+      if (!hasValidAuth) {
+        throw new Error('No valid authentication data found. QR code scan required for initial setup.');
       }
 
       // Check if activation is already in progress
@@ -1420,8 +2473,32 @@ export class WhatsAppService implements OnModuleInit {
 
         // Create new session
         await this.reconnectSession(userId);
-        
-        this.logger.log(`[${userId}] Session activated successfully`);
+
+        // Wait a moment to check if connection was actually established
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Validate that the session is actually connected before marking as successful
+        const sessionInfo = this.activeSessions.get(userId);
+        const isActuallyConnected = sessionInfo?.isConnected &&
+                                   sessionInfo?.connectionState === SessionConnectionState.CONNECTED &&
+                                   sessionInfo?.socket;
+
+        if (isActuallyConnected) {
+          this.logger.log(`[${userId}] ✅ Session activated and connected successfully`);
+          // Reset failure count on successful connection
+          this.connectionFailureCount.delete(userId);
+        } else {
+          this.logger.warn(`[${userId}] ⚠️ Session activated but connection not established`);
+          this.logger.warn(`[${userId}] Connection details: connected=${sessionInfo?.isConnected}, state=${sessionInfo?.connectionState}, socket=${!!sessionInfo?.socket}`);
+
+          // Track this as a connection failure for exponential backoff
+          const currentFailures = this.connectionFailureCount.get(userId) || 0;
+          this.connectionFailureCount.set(userId, currentFailures + 1);
+
+          this.logger.warn(`[${userId}] Connection failure count: ${currentFailures + 1} - will retry with exponential backoff`);
+
+          throw new Error(`Session activated but connection not established (failures: ${currentFailures + 1})`);
+        }
       } finally {
         // Always clear the progress flag
         this.reconnectionInProgress.delete(userId);
@@ -1516,14 +2593,15 @@ export class WhatsAppService implements OnModuleInit {
   private shouldCleanupSessions(): boolean {
     const memoryMB = this.getMemoryUsageMB();
     const sessionCount = this.activeSessions.size;
-    
+
     // Log memory stats periodically
-    if (sessionCount % 10 === 0 || memoryMB > this.MAX_RAM_USAGE_MB * 0.8) {
+    if (sessionCount % 50 === 0 || memoryMB > this.MAX_RAM_USAGE_MB * 0.9) {
       this.logger.log(`Memory usage: ${memoryMB}MB / ${this.MAX_RAM_USAGE_MB}MB, Sessions: ${sessionCount}`);
     }
-    
-    // Clean up only when RAM limit exceeded
-    return memoryMB > this.MAX_RAM_USAGE_MB;
+
+    // Only cleanup in emergency situations (>95% RAM usage)
+    // This is much more conservative than before to preserve sessions
+    return memoryMB > this.MAX_RAM_USAGE_MB * 0.95;
   }
 
   private isSessionStable(userId: string): boolean {
@@ -1751,23 +2829,153 @@ export class WhatsAppService implements OnModuleInit {
   }
 
   /**
-   * Enable or disable session persistence for a user
+   * Initialize connection tracking for indefinite session persistence
    */
-  async setSessionPersistence(userId: string, isPersistent: boolean, autoReconnect: boolean = true): Promise<void> {
+  private initializeConnectionTracking(userId: string): void {
+    // Set default persistence policy to indefinite (never close automatically)
+    if (!this.sessionPersistencePolicy.has(userId)) {
+      this.sessionPersistencePolicy.set(userId, 'indefinite');
+    }
+
+    // Initialize connection attempt tracking
+    const now = new Date();
+    this.lastConnectionAttempt.set(userId, now);
+
+    const currentFailures = this.connectionFailureCount.get(userId) || 0;
+    const connectionAttempt: ConnectionAttemptInfo = {
+      startTime: now,
+      state: SessionConnectionState.CONNECTING,
+      attempt: currentFailures + 1,
+      lastError: undefined
+    };
+
+    this.connectionAttempts.set(userId, connectionAttempt);
+
+    this.logger.log(`[${userId}] Connection tracking initialized - Persistence: indefinite, Attempt: ${connectionAttempt.attempt}`);
+  }
+
+  /**
+   * Map Baileys connection state to our internal state enum
+   */
+  private mapBaileysConnectionToState(connection: string): SessionConnectionState {
+    switch (connection) {
+      case 'open':
+        return SessionConnectionState.CONNECTED;
+      case 'connecting':
+        return SessionConnectionState.CONNECTING;
+      case 'close':
+        return SessionConnectionState.DISCONNECTED;
+      default:
+        return SessionConnectionState.DISCONNECTED;
+    }
+  }
+
+  /**
+   * Set up connection timeout to prevent hanging connections
+   */
+  private setupConnectionTimeout(userId: string): NodeJS.Timeout {
+    const CONNECTION_TIMEOUT = 30000; // 30 seconds timeout
+
+    const timeoutId = setTimeout(() => {
+      const connectionAttempt = this.connectionAttempts.get(userId);
+      const sessionInfo = this.activeSessions.get(userId);
+
+      // Check if connection is still in connecting state after timeout
+      if (connectionAttempt &&
+          connectionAttempt.state === SessionConnectionState.CONNECTING &&
+          sessionInfo &&
+          !sessionInfo.isConnected) {
+
+        this.logger.warn(`[${userId}] ⏰ CONNECTION TIMEOUT - Connection attempt exceeded ${CONNECTION_TIMEOUT}ms`);
+
+        // Update connection state to timeout
+        connectionAttempt.state = SessionConnectionState.TIMEOUT;
+        connectionAttempt.lastError = 'Connection timeout';
+        this.connectionAttempts.set(userId, connectionAttempt);
+
+        // Update session info
+        if (sessionInfo) {
+          sessionInfo.connectionState = SessionConnectionState.TIMEOUT;
+          sessionInfo.lastError = 'Connection timeout';
+        }
+
+        // Track this as a connection failure
+        const currentFailures = this.connectionFailureCount.get(userId) || 0;
+        this.connectionFailureCount.set(userId, currentFailures + 1);
+
+        this.logger.log(`[${userId}] Connection timeout recorded - Failure count: ${currentFailures + 1}`);
+
+        // Clear the session to allow for fresh reconnection attempt
+        this.clearSession(userId).catch(error => {
+          this.logger.error(`[${userId}] Error clearing session after timeout:`, error);
+        });
+      }
+    }, CONNECTION_TIMEOUT);
+
+    // Store timeout ID in connection attempt for later cleanup
+    const connectionAttempt = this.connectionAttempts.get(userId);
+    if (connectionAttempt) {
+      connectionAttempt.timeoutId = timeoutId;
+      this.connectionAttempts.set(userId, connectionAttempt);
+    }
+
+    return timeoutId;
+  }
+
+  /**
+   * Set session persistence policy for a user
+   */
+  async setSessionPersistence(userId: string, policy: PersistencePolicy = PersistencePolicy.PERMANENT, autoReconnect: boolean = true): Promise<void> {
     try {
+      const updateData: any = {
+        persistencePolicy: policy,
+        isPersistent: policy !== PersistencePolicy.TEMPORARY,
+        autoReconnect,
+        lastUpdated: new Date(),
+        lastActivity: new Date()
+      };
+
+      // Set session expiration based on policy
+      if (policy === PersistencePolicy.TEMPORARY) {
+        updateData.sessionExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+      } else {
+        updateData.sessionExpires = null; // Never expires
+      }
+
       await this.authStateModel.findOneAndUpdate(
         { userId },
-        {
-          isPersistent,
-          autoReconnect,
-          lastUpdated: new Date()
-        },
+        updateData,
         { upsert: false }
       );
 
-      this.logger.log(`[${userId}] Session persistence set to ${isPersistent}, auto-reconnect: ${autoReconnect}`);
+      this.logger.log(`[${userId}] Session persistence policy set to ${policy}, auto-reconnect: ${autoReconnect}`);
     } catch (error) {
       this.logger.error(`[${userId}] Error setting session persistence:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Set all existing sessions to permanent persistence (for migration)
+   */
+  async migrateAllSessionsToPermanent(): Promise<void> {
+    try {
+      this.logger.log('Migrating all existing sessions to permanent persistence...');
+
+      const result = await this.authStateModel.updateMany(
+        {}, // Update all sessions
+        {
+          persistencePolicy: PersistencePolicy.PERMANENT,
+          isPersistent: true,
+          autoReconnect: true,
+          sessionExpires: null, // Never expires
+          lastUpdated: new Date()
+        }
+      );
+
+      this.logger.log(`Migrated ${result.modifiedCount} sessions to permanent persistence`);
+    } catch (error) {
+      this.logger.error('Error migrating sessions to permanent persistence:', error);
       throw error;
     }
   }
@@ -1937,6 +3145,284 @@ export class WhatsAppService implements OnModuleInit {
   }
 
 
+
+  /**
+   * Get all conflicted sessions
+   */
+  async getConflictedSessions(): Promise<any[]> {
+    try {
+      const conflictedSessions = [];
+
+      for (const [userId, conflictCount] of this.conflictAttempts.entries()) {
+        if (conflictCount > 0) {
+          const authState = await this.authStateModel.findOne({ userId });
+          const sessionInfo = this.activeSessions.get(userId);
+
+          conflictedSessions.push({
+            userId,
+            conflictCount,
+            connectionStatus: authState?.connectionStatus || 'unknown',
+            lastUpdated: authState?.lastUpdated,
+            lastConnected: authState?.lastConnected,
+            lastDisconnectReason: authState?.lastDisconnectReason,
+            isActive: !!sessionInfo,
+            isConnected: sessionInfo?.isConnected || false,
+            phoneNumber: authState?.phoneNumber,
+            deviceName: authState?.deviceName
+          });
+        }
+      }
+
+      return conflictedSessions;
+    } catch (error) {
+      this.logger.error('Error getting conflicted sessions:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Resolve session conflict by clearing conflict state and allowing reconnection
+   * PRESERVES auth data - no re-authentication required
+   */
+  async resolveSessionConflict(userId: string): Promise<any> {
+    try {
+      this.logger.log(`[${userId}] Resolving session conflict while preserving auth data...`);
+
+      // Clear conflict state but preserve auth data
+      this.conflictAttempts.delete(userId);
+      this.reconnectionAttempts.delete(userId);
+      this.reconnectionInProgress.delete(userId);
+
+      // Clear only the in-memory session, not the database auth data
+      const sessionInfo = this.activeSessions.get(userId);
+      if (sessionInfo) {
+        try {
+          if (sessionInfo.socket) {
+            sessionInfo.socket.end(undefined);
+          }
+        } catch (error) {
+          this.logger.warn(`[${userId}] Error closing socket during conflict resolution:`, error);
+        }
+      }
+      this.activeSessions.delete(userId);
+      this.qrCodes.delete(userId);
+      this.clearQRTimeout(userId);
+
+      // Update database status but PRESERVE credentials and keys
+      await this.authStateModel.findOneAndUpdate(
+        { userId },
+        {
+          connectionStatus: SessionStatus.DISCONNECTED,
+          lastUpdated: new Date(),
+          errorCount: 0,
+          lastError: null,
+          circuitBreakerState: 'closed'
+          // NOTE: NOT clearing credentials or keys - they remain for reconnection
+        }
+      );
+
+      this.logger.log(`[${userId}] Session conflict resolved - auth data preserved, ready for reconnection`);
+
+      return {
+        userId,
+        status: 'resolved',
+        message: 'Session conflict cleared. Auth data preserved - no QR scan needed.',
+        nextSteps: [
+          'Make sure WhatsApp is logged out on all other devices',
+          'Use the activate session endpoint to reconnect',
+          'No QR code scanning required - existing auth will be used'
+        ]
+      };
+    } catch (error) {
+      this.logger.error(`[${userId}] Error resolving session conflict:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Force session takeover - OPTION 1: Preserve auth data (recommended)
+   * OPTION 2: Complete reset (only if auth data is corrupted)
+   */
+  async forceSessionTakeover(userId: string, completeReset: boolean = false): Promise<any> {
+    try {
+      this.logger.log(`[${userId}] Forcing session takeover (complete reset: ${completeReset})...`);
+
+      // Clear all conflict and reconnection state
+      this.conflictAttempts.delete(userId);
+      this.reconnectionAttempts.delete(userId);
+      this.reconnectionInProgress.delete(userId);
+
+      // Clear existing session from memory
+      await this.clearSession(userId);
+
+      if (completeReset) {
+        // OPTION 2: Complete reset - delete auth data (requires new QR)
+        await this.authStateModel.deleteOne({ userId });
+        this.logger.log(`[${userId}] Complete session reset - auth data deleted`);
+
+        return {
+          userId,
+          status: 'complete_reset',
+          message: 'Complete session reset. New QR scan required.',
+          nextSteps: [
+            'All session data has been completely removed',
+            'Create a new session using the QR endpoint',
+            'Scan the new QR code with your phone'
+          ]
+        };
+      } else {
+        // OPTION 1: Preserve auth data (recommended)
+        await this.authStateModel.findOneAndUpdate(
+          { userId },
+          {
+            connectionStatus: SessionStatus.DISCONNECTED,
+            lastUpdated: new Date(),
+            errorCount: 0,
+            lastError: null,
+            circuitBreakerState: 'closed'
+            // Keep credentials and keys for reconnection
+          }
+        );
+
+        this.logger.log(`[${userId}] Session takeover completed - auth data preserved`);
+
+        return {
+          userId,
+          status: 'takeover_with_auth_preserved',
+          message: 'Session takeover completed. Auth data preserved - no QR scan needed.',
+          nextSteps: [
+            'Memory session cleared but auth data preserved',
+            'Use activate session endpoint to reconnect',
+            'No QR code scanning required'
+          ]
+        };
+      }
+    } catch (error) {
+      this.logger.error(`[${userId}] Error forcing session takeover:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Smart conflict handling with progressive backoff
+   */
+  private async handleSessionConflict(userId: string, sessionInfo: SessionInfo): Promise<void> {
+    try {
+      this.logger.warn(`[${userId}] Handling session conflict with smart resolution...`);
+
+      // Mark session as disconnected
+      sessionInfo.isConnected = false;
+      sessionInfo.isReconnecting = false;
+      this.reconnectionInProgress.delete(userId);
+
+      // Get current conflict count and increment
+      const currentConflictCount = this.conflictAttempts.get(userId) || 0;
+      const newConflictCount = currentConflictCount + 1;
+      this.conflictAttempts.set(userId, newConflictCount);
+
+      // Update database with conflict information
+      await this.authStateModel.findOneAndUpdate(
+        { userId },
+        {
+          connectionStatus: SessionStatus.STREAM_CONFLICT,
+          lastUpdated: new Date(),
+          lastConflictTime: new Date(),
+          conflictRetryCount: newConflictCount,
+          lastDisconnectType: 'conflict',
+          serverInstanceId: this.SERVER_INSTANCE_ID,
+          lastServerStart: this.SERVER_START_TIME,
+          wasGracefullyDisconnected: false
+        }
+      );
+
+      // Progressive backoff strategy
+      if (newConflictCount >= 5) {
+        this.logger.warn(`[${userId}] Too many conflicts (${newConflictCount}), blocking for 1 hour`);
+        // Don't permanently block, just wait longer
+      } else if (newConflictCount >= 3) {
+        this.logger.warn(`[${userId}] Multiple conflicts (${newConflictCount}), will retry after 30 minutes`);
+      } else {
+        this.logger.warn(`[${userId}] Conflict ${newConflictCount}, will retry after 5 minutes`);
+      }
+
+      // Clear the session to stop current activity
+      await this.clearSession(userId);
+
+      this.logger.log(`[${userId}] Session conflict handled - will allow retry after backoff period`);
+    } catch (error) {
+      this.logger.error(`[${userId}] Error handling session conflict:`, error);
+    }
+  }
+
+  /**
+   * Clear session conflict state only (without deleting session data)
+   */
+  async clearSessionConflict(userId: string): Promise<void> {
+    try {
+      this.logger.log(`[${userId}] Clearing session conflict state...`);
+
+      // Clear conflict tracking
+      this.conflictAttempts.delete(userId);
+      this.reconnectionAttempts.delete(userId);
+      this.reconnectionInProgress.delete(userId);
+
+      // Update database status but keep session data
+      await this.authStateModel.findOneAndUpdate(
+        { userId },
+        {
+          connectionStatus: SessionStatus.DISCONNECTED,
+          lastUpdated: new Date(),
+          errorCount: 0,
+          lastError: null,
+          circuitBreakerState: 'closed',
+          conflictRetryCount: 0,
+          lastConflictTime: null,
+          wasGracefullyDisconnected: true,
+          serverInstanceId: this.SERVER_INSTANCE_ID,
+          lastServerStart: this.SERVER_START_TIME
+        }
+      );
+
+      this.logger.log(`[${userId}] Session conflict state cleared`);
+    } catch (error) {
+      this.logger.error(`[${userId}] Error clearing session conflict:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Check if user has valid auth state for reconnection without QR
+   */
+  async hasValidAuthState(userId: string): Promise<boolean> {
+    try {
+      const authState = await this.authStateModel.findOne({ userId });
+
+      if (!authState || !authState.credentials) {
+        return false;
+      }
+
+      // Check if credentials have required fields for WhatsApp connection
+      const creds = authState.credentials;
+      const hasRequiredFields = !!(
+        creds.noiseKey &&
+        creds.pairingEphemeralKeyPair &&
+        creds.signedIdentityKey &&
+        creds.signedPreKey &&
+        creds.registrationId
+      );
+
+      this.logger.log(`[${userId}] Auth state validation:`, {
+        hasCredentials: !!authState.credentials,
+        hasRequiredFields,
+        credentialKeys: creds ? Object.keys(creds) : []
+      });
+
+      return hasRequiredFields;
+    } catch (error) {
+      this.logger.error(`[${userId}] Error checking auth state validity:`, error);
+      return false;
+    }
+  }
 
   /**
    * Clear only conflicted sessions

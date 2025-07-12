@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-api",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WhatsApp API using Baileys library with MongoDB session storage",
   "author": "",
   "private": true,

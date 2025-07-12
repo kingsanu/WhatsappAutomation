@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { WhatsAppService } from '../services/whatsapp.service';
 import { SendMessageDto } from '../dto/send-message.dto';
+import { PersistencePolicy } from '../schemas/auth-state.schema';
 
 interface UserListQuery {
   status?: 'connected' | 'disconnected' | 'all';
@@ -20,8 +21,10 @@ interface UserListQuery {
 }
 
 interface SetPersistenceDto {
-  isPersistent: boolean;
+  policy?: PersistencePolicy;
   autoReconnect?: boolean;
+  // Legacy support
+  isPersistent?: boolean;
 }
 
 @Controller('users')
@@ -152,18 +155,9 @@ export class UserManagementController {
         );
       }
 
-      // Check if user session exists and is connected
-      const status = await this.whatsappService.getSessionStatus(userId);
-      if (!status.connected) {
-        throw new HttpException(
-          {
-            status: HttpStatus.BAD_REQUEST,
-            error: 'Session not connected',
-            message: `User ${userId} session is not connected. Status: ${status.connectionStatus}`,
-          },
-          HttpStatus.BAD_REQUEST,
-        );
-      }
+      // 🚀 INTELLIGENT SEND MESSAGE - Session status check removed
+      // The sendMessage service now handles automatic session activation
+      // No need to manually check session status here
 
       // Format phone number - ensure it has country code
       let formattedNumber = number;
@@ -211,9 +205,20 @@ export class UserManagementController {
     @Body() persistenceDto: SetPersistenceDto,
   ) {
     try {
-      const { isPersistent, autoReconnect = true } = persistenceDto;
-      
-      await this.whatsappService.setSessionPersistence(userId, isPersistent, autoReconnect);
+      const { policy, isPersistent, autoReconnect = true } = persistenceDto;
+
+      // Determine persistence policy
+      let persistencePolicy: PersistencePolicy;
+      if (policy) {
+        persistencePolicy = policy;
+      } else if (isPersistent !== undefined) {
+        // Legacy support: convert boolean to policy
+        persistencePolicy = isPersistent ? PersistencePolicy.PERMANENT : PersistencePolicy.TEMPORARY;
+      } else {
+        persistencePolicy = PersistencePolicy.PERMANENT; // Default
+      }
+
+      await this.whatsappService.setSessionPersistence(userId, persistencePolicy, autoReconnect);
       
       return {
         success: true,

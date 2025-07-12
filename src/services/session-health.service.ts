@@ -38,6 +38,15 @@ export class SessionHealthService implements OnModuleInit {
   private readonly ERROR_RATE_THRESHOLD = parseFloat(process.env.ERROR_RATE_THRESHOLD || '0.1'); // 10%
   private readonly INACTIVITY_THRESHOLD = parseInt(process.env.INACTIVITY_THRESHOLD || '3600000'); // 1 hour
 
+  // Enhanced connection tracking for indefinite session persistence
+  private readonly RECONNECTION_COOLDOWN = parseInt(process.env.RECONNECTION_COOLDOWN || '60000'); // 1 minute cooldown
+  private readonly MAX_RECONNECTION_FAILURES = parseInt(process.env.MAX_RECONNECTION_FAILURES || '5'); // Max failures before extended cooldown
+  private readonly EXTENDED_COOLDOWN = parseInt(process.env.EXTENDED_COOLDOWN || '300000'); // 5 minutes extended cooldown
+
+  // Track last reconnection attempts to prevent infinite loops
+  private lastReconnectionAttempt = new Map<string, Date>();
+  private reconnectionFailureCount = new Map<string, number>();
+
   constructor(
     @InjectModel(AuthState.name)
     private authStateModel: Model<AuthStateDocument>,
@@ -298,35 +307,108 @@ export class SessionHealthService implements OnModuleInit {
   }
 
   /**
-   * Handle an unhealthy session with automatic recovery attempts
+   * Handle an unhealthy session with automatic recovery attempts and cooldown logic
    */
   private async handleUnhealthySession(healthResult: HealthCheckResult): Promise<void> {
     const { userId, issues, recommendations } = healthResult;
-    
+
     this.logger.warn(`Unhealthy session detected for ${userId}:`, { issues, recommendations });
 
     try {
-      // Auto-recovery logic based on specific issues
+      // Auto-recovery logic based on specific issues with cooldown enforcement
       for (const issue of issues) {
         if (issue.includes('not connected') && issue.includes('exists')) {
-          this.logger.log(`[${userId}] Attempting automatic reconnection for disconnected session`);
-          // The WhatsApp service should handle this automatically, but we can trigger it
-          await this.whatsappService.activateSession(userId);
+          // Check if we should attempt reconnection based on cooldown and failure count
+          if (await this.shouldAttemptReconnection(userId)) {
+            this.logger.log(`[${userId}] Attempting automatic reconnection for disconnected session (with cooldown enforcement)`);
+
+            // Record the reconnection attempt
+            this.lastReconnectionAttempt.set(userId, new Date());
+
+            try {
+              await this.whatsappService.activateSession(userId);
+
+              // Reset failure count on successful activation attempt
+              this.reconnectionFailureCount.delete(userId);
+
+            } catch (activationError) {
+              // Track failed reconnection attempts
+              const currentFailures = this.reconnectionFailureCount.get(userId) || 0;
+              this.reconnectionFailureCount.set(userId, currentFailures + 1);
+
+              this.logger.error(`[${userId}] Reconnection activation failed (attempt ${currentFailures + 1}):`, activationError);
+
+              // If we've exceeded max failures, implement extended cooldown
+              if (currentFailures + 1 >= this.MAX_RECONNECTION_FAILURES) {
+                this.logger.warn(`[${userId}] Max reconnection failures reached (${currentFailures + 1}). Implementing extended cooldown.`);
+              }
+            }
+          } else {
+            this.logger.log(`[${userId}] Reconnection skipped due to cooldown period or max failures reached`);
+          }
         }
-        
+
         if (issue.includes('circuit breaker')) {
           this.logger.log(`[${userId}] Circuit breaker is open, scheduling reset check`);
           // Circuit breaker will reset automatically after timeout
         }
-        
+
         if (issue.includes('High reconnection attempts')) {
           this.logger.log(`[${userId}] High reconnection attempts detected, clearing session for fresh start`);
           await this.whatsappService.clearUserSession(userId);
+          // Reset our tracking when clearing session
+          this.lastReconnectionAttempt.delete(userId);
+          this.reconnectionFailureCount.delete(userId);
         }
       }
     } catch (error) {
       this.logger.error(`[${userId}] Auto-recovery failed:`, error);
     }
+  }
+
+  /**
+   * Determine if we should attempt reconnection based on cooldown and failure count
+   */
+  private async shouldAttemptReconnection(userId: string): Promise<boolean> {
+    const now = new Date();
+    const lastAttempt = this.lastReconnectionAttempt.get(userId);
+    const failureCount = this.reconnectionFailureCount.get(userId) || 0;
+
+    // If no previous attempt, allow reconnection
+    if (!lastAttempt) {
+      return true;
+    }
+
+    // Calculate time since last attempt
+    const timeSinceLastAttempt = now.getTime() - lastAttempt.getTime();
+
+    // If we've exceeded max failures, use extended cooldown
+    if (failureCount >= this.MAX_RECONNECTION_FAILURES) {
+      const cooldownPeriod = this.EXTENDED_COOLDOWN;
+      const isInCooldown = timeSinceLastAttempt < cooldownPeriod;
+
+      if (isInCooldown) {
+        const remainingCooldown = Math.ceil((cooldownPeriod - timeSinceLastAttempt) / 1000);
+        this.logger.log(`[${userId}] Extended cooldown active - ${remainingCooldown}s remaining (${failureCount} failures)`);
+        return false;
+      } else {
+        // Reset failure count after extended cooldown expires
+        this.logger.log(`[${userId}] Extended cooldown expired, resetting failure count`);
+        this.reconnectionFailureCount.delete(userId);
+        return true;
+      }
+    }
+
+    // Normal cooldown period
+    const isInCooldown = timeSinceLastAttempt < this.RECONNECTION_COOLDOWN;
+
+    if (isInCooldown) {
+      const remainingCooldown = Math.ceil((this.RECONNECTION_COOLDOWN - timeSinceLastAttempt) / 1000);
+      this.logger.log(`[${userId}] Reconnection cooldown active - ${remainingCooldown}s remaining`);
+      return false;
+    }
+
+    return true;
   }
 
   /**

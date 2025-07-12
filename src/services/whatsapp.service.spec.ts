@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getModelToken } from '@nestjs/mongoose';
 import { WhatsAppService } from './whatsapp.service';
-import { AuthState } from '../schemas/auth-state.schema';
+import { AuthState, PersistencePolicy } from '../schemas/auth-state.schema';
 
 describe('WhatsAppService', () => {
   let service: WhatsAppService;
@@ -76,7 +76,7 @@ describe('WhatsAppService', () => {
     it('should update session persistence settings', async () => {
       mockAuthStateModel.findOneAndUpdate.mockResolvedValue(mockAuthState);
       
-      await service.setSessionPersistence('test-user', true, true);
+      await service.setSessionPersistence('test-user', PersistencePolicy.PERMANENT, true);
       
       expect(mockAuthStateModel.findOneAndUpdate).toHaveBeenCalledWith(
         { userId: 'test-user' },
