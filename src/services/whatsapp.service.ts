@@ -1541,13 +1541,34 @@ export class WhatsAppService implements OnModuleInit {
 
   async getSessionStatus(userId: string): Promise<any> {
     try {
+      this.logger.log(`[${userId}] 📊 INTELLIGENT STATUS CHECK - Getting comprehensive session status`);
+
       const authState = await this.authStateModel.findOne({ userId });
-      const sessionInfo = this.activeSessions.get(userId);
+      let sessionInfo = this.activeSessions.get(userId);
 
       // Log session info for debugging
       if (sessionInfo) {
         this.logger.debug(`[${userId}] Session info: connected=${sessionInfo.isConnected}, initial=${sessionInfo.isInitialConnection}`);
       }
+
+      // Check if no auth state exists
+      if (!authState) {
+        return {
+          exists: false,
+          connected: false,
+          connectionStatus: 'not_found',
+          message: 'No authentication state found for this user',
+          canActivate: false,
+          statusType: 'no_auth',
+          activationCapability: 'requires_qr_scan'
+        };
+      }
+
+      // INTELLIGENT STATUS LOGIC - Check if session can be activated like sendMessage does
+      this.logger.log(`[${userId}] 🧠 Performing intelligent status assessment`);
+
+      // Check if we can activate this session (same logic as sendMessage)
+      const canActivate = await this.hasValidAuthState(userId);
 
       // Validate actual socket connection status
       const actualConnectionStatus = await this.validateSocketConnection(userId, sessionInfo);
@@ -1567,39 +1588,87 @@ export class WhatsAppService implements OnModuleInit {
         );
       }
 
-      // Determine the final connection status
-      // For stable sessions (not initial), trust the validation result
-      // For initial connections, trust the in-memory state if it says connected
+      // ENHANCED STATUS DETERMINATION with intelligent activation capability
       let finalConnected = actualConnectionStatus.isConnected;
       let finalConnectionStatus = actualConnectionStatus.connectionStatus;
+      let statusType = 'basic_check';
+      let activationCapability = 'unknown';
+      let canSendMessages = false;
+      let statusMessage = '';
 
-      if (sessionInfo?.isInitialConnection === false && sessionInfo.isConnected) {
-        // This is a stable session that was marked as connected by the connection event
+      if (actualConnectionStatus.isConnected) {
+        // Currently connected and validated
         finalConnected = true;
         finalConnectionStatus = 'connected';
-        this.logger.debug(`[${userId}] Using stable session state: connected`);
+        statusType = 'currently_connected';
+        activationCapability = 'already_connected';
+        canSendMessages = true;
+        statusMessage = 'Session is active and ready for messaging';
+        this.logger.log(`[${userId}] ✅ Status: Currently connected and validated`);
+      } else if (sessionInfo?.isInitialConnection === false && sessionInfo.isConnected) {
+        // Stable session marked as connected by connection event
+        finalConnected = true;
+        finalConnectionStatus = 'connected';
+        statusType = 'stable_connected';
+        activationCapability = 'already_connected';
+        canSendMessages = true;
+        statusMessage = 'Session is stable and connected';
+        this.logger.debug(`[${userId}] ✅ Using stable session state: connected`);
       } else if (sessionInfo?.isInitialConnection && sessionInfo.isConnected) {
-        // This is an initial connection that was marked as connected
+        // Initial connection marked as connected
         finalConnected = true;
         finalConnectionStatus = 'connected';
-        this.logger.debug(`[${userId}] Using initial connection state: connected`);
+        statusType = 'initial_connected';
+        activationCapability = 'already_connected';
+        canSendMessages = true;
+        statusMessage = 'Session is newly connected and ready';
+        this.logger.debug(`[${userId}] ✅ Using initial connection state: connected`);
+      } else if (canActivate) {
+        // Not currently connected but can be auto-activated (like sendMessage does)
+        finalConnected = false; // Honest about current state
+        finalConnectionStatus = 'can_auto_activate';
+        statusType = 'activatable';
+        activationCapability = 'can_auto_activate';
+        canSendMessages = true; // Can send because it will auto-activate
+        statusMessage = 'Session is disconnected but will auto-activate when sending messages (same as sendMessage behavior)';
+        this.logger.log(`[${userId}] 🔄 Status: Disconnected but can auto-activate (matches sendMessage capability)`);
+      } else {
+        // Cannot be activated - needs QR scan
+        finalConnected = false;
+        finalConnectionStatus = authState.connectionStatus || 'disconnected';
+        statusType = 'needs_qr';
+        activationCapability = 'requires_qr_scan';
+        canSendMessages = false;
+        statusMessage = 'Session requires QR code scan to activate';
+        this.logger.log(`[${userId}] ❌ Status: Disconnected and requires QR scan`);
       }
 
       return {
+        // Basic status information
         exists: !!authState,
         connected: finalConnected,
         connectionStatus: finalConnectionStatus,
         lastUpdated: authState?.lastUpdated,
         user: authState?.user || sessionInfo?.socket?.user || null,
+
+        // Enhanced intelligent status information
+        statusType: statusType,
+        activationCapability: activationCapability,
+        canSendMessages: canSendMessages,
+        message: statusMessage,
+
+        // Session state information
         isSessionActive: !!sessionInfo,
         isReconnecting: sessionInfo?.isReconnecting || false,
         reconnectionAttempts: this.reconnectionAttempts.get(userId) || 0,
         socketState: actualConnectionStatus.socketState,
         lastValidated: new Date(),
+
         // Debug information
         inMemoryConnected: sessionInfo?.isConnected,
         isInitialConnection: sessionInfo?.isInitialConnection,
         validationResult: actualConnectionStatus.isConnected,
+        canActivate: canActivate,
       };
     } catch (error) {
       this.logger.error(`Error getting session status for user ${userId}:`, error);
