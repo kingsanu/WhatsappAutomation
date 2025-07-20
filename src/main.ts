@@ -27,20 +27,11 @@ async function bootstrap() {
   });
 
   const configService = app.get(ConfigService);
-  const port = configService.get<number>("app.PORT", 3000);
-  const apiPrefix = configService.get<string>("app.API_PREFIX", "api/v1");
-  const enableAuth = configService.get<boolean>(
-    "app.ENABLE_API_KEY_AUTH",
-    true
-  );
-  const enableRateLimit = configService.get<boolean>(
-    "app.ENABLE_RATE_LIMITING",
-    true
-  );
-  const enableLogging = configService.get<boolean>(
-    "app.ENABLE_REQUEST_LOGGING",
-    true
-  );
+  const port = configService.get<number>("PORT", 3000);
+  const apiPrefix = configService.get<string>("API_PREFIX", "api/v1");
+  const enableAuth = process.env.ENABLE_API_KEY_AUTH !== "false";
+  const enableRateLimit = process.env.ENABLE_RATE_LIMITING !== "false";
+  const enableLogging = process.env.ENABLE_REQUEST_LOGGING !== "false";
 
   logger.log(`Starting WhatsApp API server...`);
   logger.log(`Port: ${port}`);
