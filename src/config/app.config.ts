@@ -50,17 +50,23 @@ class AppConfiguration {
   RATE_LIMIT_WINDOW_MS?: number = 60000;
 
   @IsBoolean()
-  @Transform(({ value }) => value === "true")
+  @Transform(
+    ({ value }) => value === "true" || (value === "false" ? false : true)
+  )
   @IsOptional()
   ENABLE_API_KEY_AUTH?: boolean = true;
 
   @IsBoolean()
-  @Transform(({ value }) => value === "true")
+  @Transform(
+    ({ value }) => value === "true" || (value === "false" ? false : true)
+  )
   @IsOptional()
   ENABLE_RATE_LIMITING?: boolean = true;
 
   @IsBoolean()
-  @Transform(({ value }) => value === "true")
+  @Transform(
+    ({ value }) => value === "true" || (value === "false" ? false : true)
+  )
   @IsOptional()
   ENABLE_REQUEST_LOGGING?: boolean = true;
 }
