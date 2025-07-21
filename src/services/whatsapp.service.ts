@@ -2077,34 +2077,36 @@ export class WhatsAppService implements OnModuleInit {
   }
 
   /**
-   * Active session status check - behaves like sendMessage by actually trying to activate the session
-   * This gives you the real connection status, not just the stored status
+   * Active session status check - behaves EXACTLY like sendMessage by actually trying to activate the session
+   * This gives you the real connection status that matches sendMessage capability
    */
   async getActiveSessionStatus(userId: string): Promise<any> {
     try {
       this.logger.log(
-        `[${userId}] 🔍 ACTIVE STATUS CHECK - Testing real connection capability (like sendMessage)`
+        `[${userId}] 🔍 ACTIVE STATUS CHECK - Testing real connection capability (EXACTLY like sendMessage)`
       );
+
+      // Check if session is marked as conflicted (same as sendMessage)
+      const conflictCount = this.conflictAttempts.get(userId) || 0;
+      if (conflictCount >= 999) {
+        return {
+          exists: true,
+          connected: false,
+          connectionStatus: "conflicted",
+          canSendMessages: false,
+          activeCheck: true,
+          activationAttempted: false,
+          realConnectionStatus: "conflicted",
+          message:
+            "Session is in conflict state. User must logout from other devices first.",
+        };
+      }
 
       // First get the basic status
       const basicStatus = await this.getSessionStatus(userId);
 
-      // If already connected, return enhanced status
-      if (basicStatus.connected && basicStatus.canSendMessages) {
-        this.logger.log(
-          `[${userId}] ✅ Already connected - returning enhanced status`
-        );
-        return {
-          ...basicStatus,
-          activeCheck: true,
-          activationAttempted: false,
-          realConnectionStatus: "already_connected",
-          message: "Session is already active and ready for messaging",
-        };
-      }
-
-      // If can't activate, return early
-      if (!basicStatus.canActivate) {
+      // If can't activate, return early (no auth state)
+      if (!basicStatus.canActivate && !basicStatus.exists) {
         this.logger.log(`[${userId}] ❌ Cannot activate - requires QR scan`);
         return {
           ...basicStatus,
@@ -2115,89 +2117,155 @@ export class WhatsAppService implements OnModuleInit {
         };
       }
 
-      // Try to activate the session (same logic as sendMessage)
-      this.logger.log(
-        `[${userId}] 🔄 Attempting session activation for status check`
-      );
+      // Try to activate the session (EXACT same logic as sendMessage with retry)
+      const maxRetries = 2;
+      let lastError: any;
 
-      try {
-        const activationResult = await this.intelligentSessionActivation(
-          userId,
-          false
-        );
-
-        if (activationResult.success) {
-          // Verify the session is actually ready
-          const readinessCheck = await this.verifySessionReadiness(userId);
-
-          if (readinessCheck.ready) {
-            this.logger.log(`[${userId}] ✅ Session activated and ready`);
-
-            // Get updated status after activation
-            const updatedStatus = await this.getSessionStatus(userId);
-
-            return {
-              ...updatedStatus,
-              connected: true,
-              canSendMessages: true,
-              activeCheck: true,
-              activationAttempted: true,
-              activationSuccessful: true,
-              realConnectionStatus: "activated_and_ready",
-              message:
-                "Session was successfully activated and is ready for messaging",
-            };
-          } else {
-            this.logger.warn(
-              `[${userId}] ⚠️ Session activated but not ready: ${readinessCheck.reason}`
-            );
-            return {
-              ...basicStatus,
-              connected: false,
-              canSendMessages: false,
-              activeCheck: true,
-              activationAttempted: true,
-              activationSuccessful: false,
-              realConnectionStatus: "activated_but_not_ready",
-              message: `Session activated but not ready: ${readinessCheck.reason}`,
-            };
-          }
-        } else {
-          this.logger.warn(
-            `[${userId}] ⚠️ Session activation failed: ${activationResult.error}`
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          this.logger.log(
+            `[${userId}] 🔄 Attempting session activation for status check (attempt ${attempt}/${maxRetries})`
           );
+
+          // Enhanced intelligent session activation and recovery (same as sendMessage)
+          const forceReactivation = attempt > 1; // Force reactivation on retry attempts
+          const activationResult = await this.intelligentSessionActivation(
+            userId,
+            forceReactivation
+          );
+
+          if (!activationResult.success) {
+            throw new Error(
+              `Session activation failed: ${activationResult.error}`
+            );
+          }
+
+          const sessionInfo = this.activeSessions.get(userId);
+          if (!sessionInfo?.socket) {
+            throw new Error(
+              "WhatsApp session could not be established after activation"
+            );
+          }
+
+          // Enhanced session readiness verification (same as sendMessage)
+          const readinessCheck = await this.verifySessionReadiness(userId);
+          if (!readinessCheck.ready) {
+            if (attempt < maxRetries) {
+              this.logger.warn(
+                `[${userId}] ⚠️ Session not ready (${readinessCheck.reason}) - will retry with force activation`
+              );
+              continue;
+            }
+            throw new Error(
+              `Session not ready for messaging: ${readinessCheck.reason}`
+            );
+          }
+
+          this.logger.log(
+            `[${userId}] ✅ Session activated and ready (attempt ${attempt})`
+          );
+
+          // Get updated status after successful activation
+          const updatedStatus = await this.getSessionStatus(userId);
+
           return {
-            ...basicStatus,
-            connected: false,
-            canSendMessages: false,
+            ...updatedStatus,
+            connected: true,
+            canSendMessages: true,
             activeCheck: true,
             activationAttempted: true,
-            activationSuccessful: false,
-            realConnectionStatus: "activation_failed",
-            message: `Session activation failed: ${activationResult.error}`,
+            activationSuccessful: true,
+            attemptsUsed: attempt,
+            realConnectionStatus: "activated_and_ready",
+            message: `Session was successfully activated and is ready for messaging (${attempt} attempt${attempt > 1 ? "s" : ""})`,
           };
+        } catch (error) {
+          lastError = error;
+          this.logger.warn(
+            `[${userId}] ⚠️ Status check activation attempt ${attempt} failed:`,
+            error.message
+          );
+
+          if (attempt === maxRetries) {
+            break;
+          }
         }
-      } catch (activationError) {
-        this.logger.error(
-          `[${userId}] ❌ Session activation error: ${activationError.message}`
-        );
-        return {
-          ...basicStatus,
-          connected: false,
-          canSendMessages: false,
-          activeCheck: true,
-          activationAttempted: true,
-          activationSuccessful: false,
-          realConnectionStatus: "activation_error",
-          message: `Session activation error: ${activationError.message}`,
-        };
       }
+
+      // If all attempts failed, return failure status
+      this.logger.error(
+        `[${userId}] ❌ All activation attempts failed for status check`
+      );
+      return {
+        ...basicStatus,
+        connected: false,
+        canSendMessages: false,
+        activeCheck: true,
+        activationAttempted: true,
+        activationSuccessful: false,
+        attemptsUsed: maxRetries,
+        realConnectionStatus: "activation_failed",
+        message: `Session activation failed after ${maxRetries} attempts: ${lastError?.message || "Unknown error"}`,
+        lastError: lastError?.message,
+      };
     } catch (error) {
       this.logger.error(
-        `Error getting active session status for user ${userId}:`,
+        `Error in active session status check for user ${userId}:`,
         error
       );
-      throw error;
+      return {
+        exists: false,
+        connected: false,
+        connectionStatus: "error",
+        canSendMessages: false,
+        activeCheck: true,
+        activationAttempted: false,
+        realConnectionStatus: "check_error",
+        message: `Status check failed: ${error.message}`,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Get the EXACT status that sendMessage would encounter
+   * This is the most accurate status check - it tells you if sendMessage would succeed
+   */
+  async getSendMessageCapabilityStatus(userId: string): Promise<any> {
+    try {
+      this.logger.log(
+        `[${userId}] 📤 SEND MESSAGE CAPABILITY CHECK - Testing exact sendMessage behavior`
+      );
+
+      // Use the active status check which now matches sendMessage exactly
+      const activeStatus = await this.getActiveSessionStatus(userId);
+
+      return {
+        ...activeStatus,
+        checkType: "send_message_capability",
+        canSendMessagesNow: activeStatus.canSendMessages,
+        wouldSendMessageSucceed:
+          activeStatus.connected && activeStatus.canSendMessages,
+        statusExplanation: activeStatus.connected
+          ? "sendMessage would succeed immediately"
+          : activeStatus.realConnectionStatus === "requires_qr"
+            ? "sendMessage would fail - QR scan required"
+            : activeStatus.realConnectionStatus === "conflicted"
+              ? "sendMessage would fail - session conflicted"
+              : "sendMessage would fail - activation failed",
+      };
+    } catch (error) {
+      this.logger.error(
+        `Error checking sendMessage capability for user ${userId}:`,
+        error
+      );
+      return {
+        canSendMessagesNow: false,
+        wouldSendMessageSucceed: false,
+        checkType: "send_message_capability",
+        error: error.message,
+        statusExplanation: "sendMessage would fail - status check error",
+      };
     }
   }
 

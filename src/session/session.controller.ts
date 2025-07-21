@@ -153,6 +153,53 @@ export class SessionController {
     }
   }
 
+  @Get("status/:username/basic")
+  async getBasicSessionStatus(@Param("username") username: string) {
+    try {
+      // Basic status check - just checks stored state without activation
+      const status = await this.whatsappService.getSessionStatus(username);
+      return {
+        success: true,
+        data: status,
+        message: "Basic session status (no activation attempted)",
+      };
+    } catch (error) {
+      throw new HttpException(
+        {
+          status: HttpStatus.INTERNAL_SERVER_ERROR,
+          error: "Failed to get basic session status",
+          message: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  @Get("status/:username/send-capability")
+  async getSendMessageCapability(@Param("username") username: string) {
+    try {
+      // Check if sendMessage would succeed right now
+      const status =
+        await this.whatsappService.getSendMessageCapabilityStatus(username);
+      return {
+        success: true,
+        data: status,
+        message: status.wouldSendMessageSucceed
+          ? "sendMessage would succeed immediately"
+          : "sendMessage would fail - " + status.statusExplanation,
+      };
+    } catch (error) {
+      throw new HttpException(
+        {
+          status: HttpStatus.INTERNAL_SERVER_ERROR,
+          error: "Failed to check send message capability",
+          message: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
   @Delete("clear/:username")
   async clearSession(@Param("username") username: string) {
     try {
