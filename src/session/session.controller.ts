@@ -34,52 +34,29 @@ export class SessionController {
   @Get("qr/:username/image")
   async getQRCode(@Param("username") username: string, @Res() res: Response) {
     try {
-      // First check if session is already connected
-      const status = await this.whatsappService.getSessionStatus(username);
-
-      if (status.connected) {
-        return res.status(200).json({
-          success: true,
-          message: "Session already connected. No QR code needed.",
-          connected: true,
-          data: {
-            user: status.user,
-            connectionStatus: status.connectionStatus,
-          },
-        });
-      }
-
-      // Session persistence: Do not clear sessions based on age
-      // Sessions should persist indefinitely unless manually removed
+      // Check if any session exists for this user (connected or disconnected)
       const sessionInfo = this.whatsappService.getSessionInfo(username);
       if (sessionInfo) {
         this.logger.log(
-          `Existing session found for ${username}, preserving for persistence`
+          `Existing session found for ${username}, terminating to ensure clean state for new QR code`
+        );
+        // Terminate existing session to ensure clean state
+        await this.whatsappService.terminateSession(username);
+        this.logger.log(
+          `Session terminated for ${username}, proceeding with new QR generation`
         );
       }
 
+      // Create a new session and generate QR code
       let qrCode: string;
-
       try {
-        qrCode = await this.whatsappService.getQRCode(username);
+        qrCode = await this.whatsappService.createSession(username);
       } catch (error) {
-        // If QR code doesn't exist, create a new session
+        // If createSession fails, try to get existing QR code as fallback
         try {
-          qrCode = await this.whatsappService.createSession(username);
-        } catch (sessionError) {
-          if (
-            sessionError.message.includes(
-              "Session already exists and is connected"
-            )
-          ) {
-            // If session exists and is connected, return JSON response
-            return res.status(200).json({
-              success: true,
-              message: "Session already connected. No QR code needed.",
-              connected: true,
-            });
-          }
-          throw sessionError;
+          qrCode = await this.whatsappService.getQRCode(username);
+        } catch (qrError) {
+          throw error; // Throw the original createSession error
         }
       }
 
