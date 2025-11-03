@@ -2436,6 +2436,7 @@ export class WhatsAppService implements OnModuleInit {
             document: Buffer.from(buffer),
             mimetype: mimeType,
             fileName: documentUrl.split("/").pop() || "document",
+            caption: message || "",
           });
         }
       } else if (message) {
